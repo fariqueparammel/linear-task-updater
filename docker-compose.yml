@@ -1,0 +1,10 @@
+services:
+  sync-engine:
+    build: .
+    container_name: linear-sync-engine
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./state:/app/state
+      - ./logs:/app/logs
