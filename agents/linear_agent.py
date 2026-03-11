@@ -21,6 +21,9 @@ logger = logging.getLogger("agent.linear")
 AUTO_SYNC_LABEL_NAME = "auto-sync"
 AUTO_SYNC_LABEL_COLOR = "#6B7280"
 
+BOT_NAME = "CommitPilot"
+BOT_SIGNATURE = f"\n\n---\n_Created by **{BOT_NAME}** — automated commit-to-task sync_"
+
 
 class LinearAgent:
     """Safe Linear integration agent. Creates/updates, never deletes."""
@@ -280,11 +283,13 @@ class LinearAgent:
           }
         }
         """
+        description = result.description + BOT_SIGNATURE
+
         variables = {
             "input": {
                 "teamId": self._team_uuid,
                 "title": result.title,
-                "description": result.description,
+                "description": description,
                 "priority": result.priority,
                 "labelIds": label_ids,
             }
@@ -303,7 +308,11 @@ class LinearAgent:
                 source_commits=source_shas,
             )
             self._state.add_created_issue(record)
-            logger.info(f"Created issue {issue['identifier']}: {result.title}")
+            logger.info(
+                f"LINEAR TASK CREATED by {BOT_NAME} | {issue['identifier']} | "
+                f"\"{result.title}\" | priority={result.priority} | "
+                f"label={result.label} | url={issue['url']}"
+            )
         else:
             logger.error(f"Failed to create issue: {data}")
 
@@ -339,11 +348,13 @@ class LinearAgent:
           }
         }
         """
+        description = result.description + BOT_SIGNATURE
+
         variables = {
             "input": {
                 "teamId": self._team_uuid,
                 "title": result.title,
-                "description": result.description,
+                "description": description,
                 "priority": result.priority,
                 "labelIds": label_ids,
                 "parentId": parent_uuid,
@@ -364,7 +375,10 @@ class LinearAgent:
             )
             self._state.add_created_issue(record)
             logger.info(
-                f"Created subtask {issue['identifier']} under {result.parent_issue_id}: {result.title}"
+                f"LINEAR SUBTASK CREATED by {BOT_NAME} | {issue['identifier']} | "
+                f"parent={result.parent_issue_id} | "
+                f"\"{result.title}\" | priority={result.priority} | "
+                f"label={result.label} | url={issue['url']}"
             )
         else:
             logger.error(f"Failed to create subtask: {data}")
@@ -398,7 +412,7 @@ class LinearAgent:
 
         # Append to description rather than replacing
         existing_desc = self._get_issue_description(issue_uuid)
-        separator = "\n\n---\n_Auto-sync update:_\n"
+        separator = f"\n\n---\n_Updated by **{BOT_NAME}**:_\n"
         new_desc = (existing_desc or "") + separator + result.description
 
         mutation = """
@@ -421,7 +435,11 @@ class LinearAgent:
         update_data = self._safe_get(data, "data", "issueUpdate") or {}
 
         if update_data.get("success"):
-            logger.info(f"Updated issue {result.existing_issue_id}: {result.title}")
+            logger.info(
+                f"LINEAR TASK UPDATED by {BOT_NAME} | {result.existing_issue_id} | "
+                f"\"{result.title}\" | priority={result.priority} | "
+                f"label={result.label}"
+            )
         else:
             logger.error(f"Failed to update issue: {data}")
 
