@@ -1,11 +1,18 @@
 import os
 import json
 import tempfile
+import time
 import logging
+from datetime import datetime, timezone
 from models import CommitInfo, LinearIssueRecord
 import config
 
 logger = logging.getLogger("state")
+
+# Cache TTL defaults (in seconds)
+USER_ISSUES_TTL = 600       # 10 minutes — user's recent issues
+TEAM_MEMBERS_TTL = 3600     # 1 hour — team member mapping
+STALE_CLEANUP_INTERVAL = 300  # 5 minutes — how often to auto-purge
 
 
 class StateManager:
@@ -82,5 +89,113 @@ class StateManager:
 
     def get_issue_by_identifier(self, identifier: str) -> LinearIssueRecord | None:
         for issue in self.get_created_issues():
-            return issue if issue.identifier == identifier else None
+            if issue.identifier == identifier:
+                return issue
         return None
+
+
+class CacheManager:
+    """
+    JSON-based cache with TTL for expensive API lookups.
+    Stores entries as {key: {"data": ..., "ts": unix_timestamp}}.
+    Auto-purges stale entries on read/write to keep the file clean.
+    """
+
+    def __init__(self, state_dir: str | None = None):
+        cache_dir = state_dir or config.STATE_DIR
+        os.makedirs(cache_dir, exist_ok=True)
+        self._cache_path = os.path.join(cache_dir, "cache.json")
+        self._last_cleanup = 0.0
+
+    def _load(self) -> dict:
+        if not os.path.exists(self._cache_path):
+            return {}
+        try:
+            with open(self._cache_path, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            logger.warning(f"Corrupt cache file, resetting: {e}")
+            return {}
+
+    def _save(self, data: dict):
+        dir_name = os.path.dirname(self._cache_path)
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp_path, self._cache_path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+
+    def get(self, key: str, ttl: int) -> dict | list | None:
+        """
+        Retrieve a cached value if it exists and is not older than ttl seconds.
+        Returns None on miss or expiry.
+        """
+        self._maybe_cleanup()
+        cache = self._load()
+        entry = cache.get(key)
+        if entry is None:
+            return None
+
+        age = time.time() - entry.get("ts", 0)
+        if age > ttl:
+            logger.debug(f"Cache expired for '{key}' (age={age:.0f}s > ttl={ttl}s)")
+            return None
+
+        logger.debug(f"Cache hit for '{key}' (age={age:.0f}s)")
+        return entry["data"]
+
+    def set(self, key: str, data):
+        """Store a value in the cache with the current timestamp."""
+        cache = self._load()
+        cache[key] = {"data": data, "ts": time.time()}
+        self._save(cache)
+        logger.debug(f"Cache set for '{key}'")
+
+    def invalidate(self, key: str):
+        """Remove a specific key from the cache."""
+        cache = self._load()
+        if key in cache:
+            del cache[key]
+            self._save(cache)
+            logger.debug(f"Cache invalidated for '{key}'")
+
+    def purge_stale(self, max_age: int = 86400):
+        """Remove all entries older than max_age seconds (default 24h)."""
+        cache = self._load()
+        now = time.time()
+        before = len(cache)
+        cache = {
+            k: v for k, v in cache.items()
+            if now - v.get("ts", 0) <= max_age
+        }
+        removed = before - len(cache)
+        if removed > 0:
+            self._save(cache)
+            logger.info(f"Cache purge: removed {removed} stale entries (>{max_age}s old)")
+        return removed
+
+    def _maybe_cleanup(self):
+        """Auto-purge very old entries periodically."""
+        now = time.time()
+        if now - self._last_cleanup < STALE_CLEANUP_INTERVAL:
+            return
+        self._last_cleanup = now
+        self.purge_stale(max_age=86400)  # Remove entries older than 24h
+
+    def stats(self) -> dict:
+        """Return cache statistics for debugging."""
+        cache = self._load()
+        now = time.time()
+        total = len(cache)
+        if total == 0:
+            return {"total": 0, "oldest_age": 0, "newest_age": 0}
+        ages = [now - v.get("ts", 0) for v in cache.values()]
+        return {
+            "total": total,
+            "oldest_age": int(max(ages)),
+            "newest_age": int(min(ages)),
+        }

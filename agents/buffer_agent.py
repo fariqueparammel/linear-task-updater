@@ -2,8 +2,10 @@
 Buffer Agent
 Manages commit batching: collects commits and triggers processing
 when batch size is reached or timeout expires.
+Critical commits (hotfix, security, crash) bypass the batch threshold.
 """
 
+import re
 import logging
 from datetime import datetime, timezone
 from models import CommitInfo
@@ -11,6 +13,11 @@ from state import StateManager
 import config
 
 logger = logging.getLogger("agent.buffer")
+
+CRITICAL_PATTERNS = re.compile(
+    r"(hotfix|critical|urgent|security|CVE-|crash|breaking|emergency|rollback)",
+    re.IGNORECASE,
+)
 
 
 class BufferAgent:
@@ -26,10 +33,20 @@ class BufferAgent:
         self._state.save_buffer(buffer)
         logger.info(f"Buffered {len(commits)} commit(s). Buffer size: {len(buffer)}")
 
+    def has_critical(self) -> bool:
+        """Check if any buffered commit matches critical keywords."""
+        buffer = self._state.load_buffer()
+        for commit in buffer:
+            if CRITICAL_PATTERNS.search(commit.message):
+                logger.info(f"Critical commit detected: {commit.sha[:8]} — {commit.message[:60]}")
+                return True
+        return False
+
     def is_ready(self) -> bool:
         """
         Returns True if a batch should be processed:
         - Buffer has >= BATCH_SIZE commits, OR
+        - Buffer is non-empty and contains a critical commit, OR
         - Buffer is non-empty and the oldest commit is older than BATCH_TIMEOUT_SECONDS.
         """
         buffer = self._state.load_buffer()
@@ -37,6 +54,14 @@ class BufferAgent:
             return False
 
         if len(buffer) >= config.BATCH_SIZE:
+            return True
+
+        # Critical commits bypass batch threshold
+        if self.has_critical():
+            logger.info(
+                f"Critical commit in buffer — bypassing batch threshold. "
+                f"Processing {len(buffer)} commit(s) immediately."
+            )
             return True
 
         # Check timeout on oldest commit

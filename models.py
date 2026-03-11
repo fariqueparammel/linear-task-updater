@@ -28,6 +28,7 @@ class GeminiResult:
     state: str                         # Todo, In Progress, Done
     parent_issue_id: str | None = None
     existing_issue_id: str | None = None
+    is_critical: bool = False
 
     VALID_ACTIONS = {"CREATE_NEW", "ADD_SUBTASK", "UPDATE_EXISTING"}
     VALID_LABELS = {"Bug", "Feature", "Improvement", "Chore", "Refactor"}
@@ -59,6 +60,7 @@ class GeminiResult:
             state=d.get("state", "Todo"),
             parent_issue_id=d.get("parent_issue_id"),
             existing_issue_id=d.get("existing_issue_id"),
+            is_critical=bool(d.get("is_critical", False)),
         )
 
 

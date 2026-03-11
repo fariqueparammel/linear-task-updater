@@ -52,9 +52,14 @@ def main():
     gemini = GeminiAgent(config.GEMINI_KEYS)
     linear = LinearAgent(config.LINEAR_API_KEY, config.LINEAR_TEAM_ID, state)
 
-    # 3. One-time setup
+    # 3. One-time setup — resolve team key to UUID
+    linear.resolve_team()
+    if not linear._team_uuid:
+        logger.error("Could not resolve Linear team. Check LINEAR_TEAM_ID in .env")
+        return
     linear.ensure_auto_sync_label()
     linear.fetch_team_labels()
+    linear.fetch_team_members()
 
     # 4. Main loop
     while not _shutdown:
@@ -64,23 +69,37 @@ def main():
             # Fetch new commits from all org repos
             new_commits, updated_shas = github.fetch_all_org_commits(repo_shas)
 
-            # Buffer them
-            if new_commits:
-                buffer.add_commits(new_commits)
+            # Always save SHA positions (even on first run with 0 new commits)
+            if updated_shas:
                 state.update_repo_shas(updated_shas)
 
-            # Process all ready batches
+            # Buffer new commits
+            if new_commits:
+                buffer.add_commits(new_commits)
+
+            # Process all ready batches (one at a time with cooldown)
             while buffer.is_ready() and not _shutdown:
                 batch = buffer.get_batch()
                 created_issues = state.get_created_issues()
 
-                result = gemini.classify(batch, created_issues)
+                # Per-user correlation: fetch the commit author's recent Linear tasks
+                primary_author = batch[0].author if batch else None
+                user_recent_issues = None
+                if primary_author:
+                    user_recent_issues = linear.fetch_user_recent_issues(primary_author)
+
+                result = gemini.classify(batch, created_issues, user_recent_issues)
 
                 if result:
                     source_shas = [c.sha for c in batch]
                     linear.execute(result, source_shas)
 
                 buffer.clear_batch(batch)
+
+                # Cooldown between Gemini calls to respect rate limits
+                if buffer.is_ready():
+                    logger.debug("Cooling down 10s before next batch...")
+                    time.sleep(10)
 
         except KeyboardInterrupt:
             break

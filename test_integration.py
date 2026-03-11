@@ -12,6 +12,8 @@ Each test phase can be run independently. The script will:
     - [Phase 3] Test Gemini classification (send sample commits, get JSON back)
     - [Phase 4] Test Linear (create label, create issue, update issue, create subtask)
     - [Phase 5] Full pipeline: GitHub -> Buffer -> Gemini -> Linear end-to-end
+    - [Phase 6] Models & state offline checks
+    - [Phase 7] Per-user correlation & critical task override
     - [Cleanup] Optionally delete test issues (asks for confirmation)
 
 No destructive actions are taken without user confirmation.
@@ -33,8 +35,8 @@ import config
 from models import CommitInfo, GeminiResult, LinearIssueRecord
 from state import StateManager
 from agents.github_agent import GitHubAgent
-from agents.buffer_agent import BufferAgent
-from agents.gemini_agent import GeminiAgent, KeyManager
+from agents.buffer_agent import BufferAgent, CRITICAL_PATTERNS
+from agents.gemini_agent import GeminiAgent, SlotManager
 from agents.linear_agent import LinearAgent, AUTO_SYNC_LABEL_NAME
 
 # ─────────────────────────────────────────────
@@ -106,6 +108,18 @@ def make_sample_commits(count=3) -> list[CommitInfo]:
     return samples[:count]
 
 
+def make_critical_commit() -> CommitInfo:
+    """Generate a commit with critical keywords."""
+    return CommitInfo(
+        sha="crit_001",
+        message="hotfix: critical security patch for auth bypass vulnerability",
+        author="test-dev",
+        repo="test-org/test-repo",
+        branch="main",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
+
+
 # ─────────────────────────────────────────────
 # Phase 1: Config Validation
 # ─────────────────────────────────────────────
@@ -139,6 +153,13 @@ def test_phase1_config():
         "Gemini API keys loaded",
         gemini_count >= 1,
         f"{gemini_count} key(s) found (recommended: 3)",
+    )
+
+    model_count = len(config.GEMINI_MODELS)
+    log_result(
+        "Gemini models configured",
+        model_count >= 1,
+        f"{model_count} model(s): {', '.join(config.GEMINI_MODELS[:3])}...",
     )
 
     log_result(
@@ -228,16 +249,18 @@ def test_phase3_gemini():
         log_skip("Gemini tests", "No Gemini API keys set")
         return False
 
-    # Test 3a: Key rotation
-    km = KeyManager(config.GEMINI_KEYS)
-    first_key = km.get_key()
-    km.rotate()
-    second_key = km.get_key()
+    # Test 3a: Slot rotation (key × model)
+    sm = SlotManager(config.GEMINI_KEYS, config.GEMINI_MODELS)
+    first_slot = sm.get()
+    sm.rotate()
+    second_slot = sm.get()
 
-    if len(config.GEMINI_KEYS) > 1:
-        log_result("Key rotation", first_key != second_key, "Keys rotate correctly")
-    else:
-        log_result("Key rotation", True, "Only 1 key — rotation wraps around (OK)")
+    total_slots = len(config.GEMINI_KEYS) * len(config.GEMINI_MODELS)
+    log_result(
+        "Slot rotation (key × model)",
+        first_slot != second_slot or total_slots == 1,
+        f"{total_slots} total slot(s) ({len(config.GEMINI_KEYS)} keys × {len(config.GEMINI_MODELS)} models)",
+    )
 
     # Test 3b: Classify sample commits
     gemini = GeminiAgent(config.GEMINI_KEYS)
@@ -262,6 +285,11 @@ def test_phase3_gemini():
             0 <= result.priority <= 4,
             f"priority={result.priority}",
         )
+        log_result(
+            "Result has is_critical field",
+            isinstance(result.is_critical, bool),
+            f"is_critical={result.is_critical}",
+        )
         errors = result.validate()
         log_result(
             "Result passes validation",
@@ -270,6 +298,20 @@ def test_phase3_gemini():
         )
     else:
         log_result("Gemini classification", False, "Returned None — check API key / quota")
+
+    # Test 3c: Classify with user context
+    if result:
+        log_info("Testing Gemini with per-user task context...")
+        user_issues = [
+            {"identifier": "TEST-1", "title": "Add JWT authentication", "state": "In Progress"},
+            {"identifier": "TEST-2", "title": "Fix database connection pool", "state": "Done"},
+        ]
+        result2 = gemini.classify(sample_commits[:1], [], user_recent_issues=user_issues)
+        log_result(
+            "Gemini with user context",
+            result2 is not None,
+            f"action={result2.action}" if result2 else "Failed",
+        )
 
     return result is not None
 
@@ -294,7 +336,19 @@ def test_phase4_linear():
         state = StateManager()
         linear = LinearAgent(config.LINEAR_API_KEY, config.LINEAR_TEAM_ID, state)
 
-        # Test 4a: Ensure auto-sync label
+        # Test 4a: Resolve team
+        linear.resolve_team()
+        log_result(
+            "Resolve team",
+            linear._team_uuid is not None,
+            f"team_uuid={linear._team_uuid}",
+        )
+
+        if not linear._team_uuid:
+            log_skip("Remaining Linear tests", "Could not resolve team")
+            return False
+
+        # Test 4b: Ensure auto-sync label
         log_info("Ensuring 'auto-sync' label exists on Linear...")
         linear.ensure_auto_sync_label()
         log_result(
@@ -307,15 +361,33 @@ def test_phase4_linear():
             log_skip("Remaining Linear tests", "Could not create/find auto-sync label")
             return False
 
-        # Test 4b: Fetch team labels
+        # Test 4c: Fetch team labels
         linear.fetch_team_labels()
         log_result(
             "Fetch team labels",
-            len(linear._label_cache) >= 0,  # could be 0 if no labels configured
+            len(linear._label_cache) >= 0,
             f"{len(linear._label_cache)} label(s) cached",
         )
 
-        # Test 4c: Create a test issue
+        # Test 4d: Fetch team members (new)
+        linear.fetch_team_members()
+        log_result(
+            "Fetch team members",
+            len(linear._user_cache) >= 0,
+            f"{len(linear._user_cache)} user lookup key(s) cached",
+        )
+
+        # Test 4e: Fetch user recent issues (new)
+        log_info("Testing per-user recent issue fetch...")
+        # Use a dummy name — should fall back to team issues
+        user_issues = linear.fetch_user_recent_issues("test-nonexistent-user")
+        log_result(
+            "Fetch user recent issues (fallback)",
+            isinstance(user_issues, list),
+            f"{len(user_issues)} issue(s) returned (team fallback)",
+        )
+
+        # Test 4f: Create a test issue
         log_info("Creating a test issue on Linear...")
         test_result = GeminiResult(
             action="CREATE_NEW",
@@ -342,14 +414,14 @@ def test_phase4_linear():
         parent_issue = created[-1]
         _test_issue_ids.append(parent_issue.identifier)
 
-        # Test 4d: Verify ownership check
+        # Test 4g: Verify ownership check
         is_owned = state.is_owned_issue(parent_issue.identifier)
         log_result("Ownership check (owned)", is_owned, parent_issue.identifier)
 
         is_not_owned = not state.is_owned_issue("FAKE-99999")
         log_result("Ownership check (not owned)", is_not_owned, "FAKE-99999 correctly rejected")
 
-        # Test 4e: Update the test issue
+        # Test 4h: Update the test issue
         log_info("Updating the test issue...")
         update_result = GeminiResult(
             action="UPDATE_EXISTING",
@@ -370,7 +442,7 @@ def test_phase4_linear():
             f"Description length: {len(desc or '')} chars",
         )
 
-        # Test 4f: Create a subtask under the test issue
+        # Test 4i: Create a subtask under the test issue
         log_info("Creating a subtask under the test issue...")
         subtask_result = GeminiResult(
             action="ADD_SUBTASK",
@@ -393,7 +465,7 @@ def test_phase4_linear():
             f"identifier={updated_issues[-1].identifier if subtask_created else 'NONE'}",
         )
 
-        # Test 4g: Safety — refuse to update non-owned issue
+        # Test 4j: Safety — refuse to update non-owned issue
         log_info("Testing safety: refuse to update non-owned issue...")
         unsafe_result = GeminiResult(
             action="UPDATE_EXISTING",
@@ -404,7 +476,6 @@ def test_phase4_linear():
             state="Todo",
             existing_issue_id="FAKE-99999",
         )
-        # This should log a warning and NOT crash
         linear.execute(unsafe_result)
         log_result("Safety: refuse non-owned update", True, "No crash, update was blocked")
 
@@ -445,15 +516,21 @@ def test_phase5_pipeline():
         gemini = GeminiAgent(config.GEMINI_KEYS)
         linear = LinearAgent(config.LINEAR_API_KEY, config.LINEAR_TEAM_ID, state)
 
+        linear.resolve_team()
+        if not linear._team_uuid:
+            log_skip("Pipeline test", "Could not resolve Linear team")
+            return False
+
         linear.ensure_auto_sync_label()
         linear.fetch_team_labels()
+        linear.fetch_team_members()
 
         # Step 1: Fetch real commits from org
         log_info("Fetching real commits from org...")
         repo_shas = state.get_repo_shas()
         new_commits, updated_shas = github.fetch_all_org_commits(repo_shas)
 
-        if new_commits:
+        if updated_shas:
             state.update_repo_shas(updated_shas)
         log_result(
             "Pipeline: GitHub fetch",
@@ -472,23 +549,31 @@ def test_phase5_pipeline():
             log_skip("Pipeline: Gemini + Linear", "Buffer not ready")
             return False
 
-        # Step 3: Classify with Gemini
+        # Step 3: Fetch per-user context
+        primary_author = commits_to_use[0].author
+        user_recent_issues = linear.fetch_user_recent_issues(primary_author)
+        log_result(
+            "Pipeline: Per-user context",
+            isinstance(user_recent_issues, list),
+            f"{len(user_recent_issues)} issue(s) for author '{primary_author}'",
+        )
+
+        # Step 4: Classify with Gemini (with user context)
         batch = buffer.get_batch()
-        log_info(f"Sending {len(batch)} commits to Gemini...")
-        result = gemini.classify(batch, state.get_created_issues())
+        log_info(f"Sending {len(batch)} commits to Gemini (with user context)...")
+        result = gemini.classify(batch, state.get_created_issues(), user_recent_issues)
 
         log_result(
             "Pipeline: Gemini classify",
             result is not None,
-            f"action={result.action}, title='{result.title[:40]}'" if result else "Failed",
+            f"action={result.action}, title='{result.title[:40]}', is_critical={result.is_critical}" if result else "Failed",
         )
 
         if not result:
             log_skip("Pipeline: Linear sync", "Gemini classification failed")
             return False
 
-        # Step 4: Sync to Linear
-        # Override title to mark as test
+        # Step 5: Sync to Linear
         result.title = f"[PIPELINE TEST] {result.title}"
         source_shas = [c.sha for c in batch]
         log_info("Syncing to Linear...")
@@ -504,7 +589,7 @@ def test_phase5_pipeline():
             f"Created {created[-1].identifier}" if pipeline_ok else "No issue created",
         )
 
-        # Step 5: Clear buffer
+        # Step 6: Clear buffer
         buffer.clear_batch(batch)
         remaining = state.load_buffer()
         log_result("Pipeline: Buffer cleared", len(remaining) == 0, f"{len(remaining)} remaining")
@@ -544,6 +629,19 @@ def test_phase6_models_and_state():
         "parent_issue_id" in str(subtask_no_parent.validate()),
     )
 
+    # Test is_critical field
+    critical_result = GeminiResult.from_dict({
+        "action": "CREATE_NEW", "title": "hotfix", "description": "urgent fix",
+        "priority": 1, "label": "Bug", "state": "Todo", "is_critical": True,
+    })
+    log_result("GeminiResult is_critical=True", critical_result.is_critical is True)
+
+    non_critical = GeminiResult.from_dict({
+        "action": "CREATE_NEW", "title": "refactor", "description": "cleanup",
+        "priority": 4, "label": "Chore", "state": "Todo",
+    })
+    log_result("GeminiResult is_critical defaults False", non_critical.is_critical is False)
+
     # Test LinearIssueRecord serialization
     rec = LinearIssueRecord("uuid1", "TEAM-1", "https://example.com", "2025-01-01", ["sha1"])
     rec2 = LinearIssueRecord.from_dict(rec.to_dict())
@@ -572,8 +670,74 @@ def test_phase6_models_and_state():
         log_result("State: issue registry", sm.is_owned_issue("TEAM-1"))
         log_result("State: non-owned rejected", not sm.is_owned_issue("FAKE-999"))
 
+        # get_issue_by_identifier (bug fix verification)
+        found = sm.get_issue_by_identifier("TEAM-1")
+        log_result("State: get_issue_by_identifier (found)", found is not None and found.identifier == "TEAM-1")
+        not_found = sm.get_issue_by_identifier("TEAM-999")
+        log_result("State: get_issue_by_identifier (not found)", not_found is None)
+
     finally:
         config.STATE_DIR = original
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+
+# ─────────────────────────────────────────────
+# Phase 7: Critical Task & Buffer Override
+# ─────────────────────────────────────────────
+
+def test_phase7_critical_and_buffer():
+    section("Phase 7: Critical Task Detection & Buffer Override (Offline)")
+
+    # Test critical patterns match
+    critical_msgs = [
+        "hotfix: fix auth bypass",
+        "CRITICAL: production database down",
+        "urgent: fix payment processing",
+        "security: patch CVE-2025-1234",
+        "fix crash on startup",
+        "breaking: API change in v2",
+        "emergency: rollback deployment",
+    ]
+    for msg in critical_msgs:
+        matched = bool(CRITICAL_PATTERNS.search(msg))
+        log_result(f"Critical pattern: '{msg[:40]}'", matched)
+
+    # Test non-critical messages don't match
+    normal_msgs = [
+        "feat: add dark mode toggle",
+        "chore: update dependencies",
+        "refactor: simplify auth logic",
+        "fix: typo in readme",
+    ]
+    for msg in normal_msgs:
+        not_matched = not bool(CRITICAL_PATTERNS.search(msg))
+        log_result(f"Non-critical: '{msg[:40]}'", not_matched)
+
+    # Test buffer agent has_critical and is_ready override
+    test_dir = tempfile.mkdtemp(prefix="buffer_critical_test_")
+    original = config.STATE_DIR
+    original_batch = config.BATCH_SIZE
+    config.STATE_DIR = test_dir
+    config.BATCH_SIZE = 3  # Need 3 commits normally
+
+    try:
+        state = StateManager()
+        buffer = BufferAgent(state)
+
+        # Add only 1 normal commit — should NOT be ready
+        buffer.add_commits([make_sample_commits(1)[0]])
+        log_result("Buffer: 1 normal commit, not ready", not buffer.is_ready())
+        log_result("Buffer: no critical in buffer", not buffer.has_critical())
+
+        # Clear and add 1 critical commit — SHOULD be ready (override)
+        state.save_buffer([])
+        buffer.add_commits([make_critical_commit()])
+        log_result("Buffer: has_critical detects critical", buffer.has_critical())
+        log_result("Buffer: critical commit overrides batch size", buffer.is_ready())
+
+    finally:
+        config.STATE_DIR = original
+        config.BATCH_SIZE = original_batch
         shutil.rmtree(test_dir, ignore_errors=True)
 
 
@@ -598,7 +762,7 @@ def cleanup():
 
 def main():
     print("\n" + "=" * 60)
-    print("  GitHub → Linear Sync Engine — Integration Tests")
+    print("  GitHub -> Linear Sync Engine — Integration Tests")
     print("=" * 60)
 
     # Setup minimal logging (suppress noisy output from agents)
@@ -616,6 +780,7 @@ def main():
         return
 
     test_phase6_models_and_state()
+    test_phase7_critical_and_buffer()
     test_phase2_github()
     test_phase3_gemini()
     test_phase4_linear()

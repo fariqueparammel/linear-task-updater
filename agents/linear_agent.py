@@ -13,7 +13,7 @@ import logging
 from datetime import datetime, timezone
 import requests
 from models import GeminiResult, LinearIssueRecord
-from state import StateManager
+from state import StateManager, CacheManager, USER_ISSUES_TTL, TEAM_MEMBERS_TTL
 import config
 
 logger = logging.getLogger("agent.linear")
@@ -27,15 +27,46 @@ class LinearAgent:
 
     def __init__(self, api_key: str, team_id: str, state: StateManager):
         self._api_key = api_key
-        self._team_id = team_id
+        self._team_id = team_id          # Could be key like "LAT" or UUID
+        self._team_uuid: str | None = None  # Resolved UUID
         self._state = state
         self._auto_sync_label_id: str | None = None
         self._label_cache: dict[str, str] = {}  # name -> id
+        self._user_cache: dict[str, str] = {}  # lowercase display name -> linear user id
+        self._cache = CacheManager()
 
     # --- Setup (run once on startup) ---
 
+    def resolve_team(self):
+        """Resolve team key/identifier to UUID. Must be called before other operations."""
+        # Try finding the team by key first (e.g. "LAT"), then by id
+        query = """
+        query {
+          teams {
+            nodes { id key name }
+          }
+        }
+        """
+        data = self._gql(query)
+        nodes = self._safe_get(data, "data", "teams", "nodes") or []
+
+        for team in nodes:
+            if team["id"] == self._team_id or team["key"] == self._team_id:
+                self._team_uuid = team["id"]
+                logger.info(f"Resolved team '{self._team_id}' → {team['name']} (UUID: {self._team_uuid})")
+                return
+
+        logger.error(
+            f"Could not resolve team '{self._team_id}'. "
+            f"Available teams: {[t['key'] for t in nodes]}"
+        )
+
     def ensure_auto_sync_label(self):
         """Create the 'auto-sync' label if it doesn't exist."""
+        if not self._team_uuid:
+            logger.error("Team not resolved. Call resolve_team() first.")
+            return
+
         query = """
         query {
           issueLabels(filter: { name: { eq: "%s" } }) {
@@ -45,7 +76,7 @@ class LinearAgent:
         """ % AUTO_SYNC_LABEL_NAME
 
         data = self._gql(query)
-        nodes = data.get("data", {}).get("issueLabels", {}).get("nodes", [])
+        nodes = self._safe_get(data, "data", "issueLabels", "nodes") or []
 
         if nodes:
             self._auto_sync_label_id = nodes[0]["id"]
@@ -62,10 +93,10 @@ class LinearAgent:
                 issueLabel { id name }
               }
             }
-            """ % (AUTO_SYNC_LABEL_NAME, AUTO_SYNC_LABEL_COLOR, self._team_id)
+            """ % (AUTO_SYNC_LABEL_NAME, AUTO_SYNC_LABEL_COLOR, self._team_uuid)
 
             data = self._gql(mutation)
-            result = data.get("data", {}).get("issueLabelCreate", {})
+            result = self._safe_get(data, "data", "issueLabelCreate") or {}
             if result.get("success"):
                 self._auto_sync_label_id = result["issueLabel"]["id"]
                 logger.info(f"Created '{AUTO_SYNC_LABEL_NAME}' label: {self._auto_sync_label_id}")
@@ -74,18 +105,149 @@ class LinearAgent:
 
     def fetch_team_labels(self):
         """Cache all team labels (name -> id mapping)."""
+        if not self._team_uuid:
+            logger.error("Team not resolved. Call resolve_team() first.")
+            return
+
         query = """
         query {
           issueLabels(filter: { team: { id: { eq: "%s" } } }) {
             nodes { id name }
           }
         }
-        """ % self._team_id
+        """ % self._team_uuid
 
         data = self._gql(query)
-        nodes = data.get("data", {}).get("issueLabels", {}).get("nodes", [])
+        nodes = self._safe_get(data, "data", "issueLabels", "nodes") or []
         self._label_cache = {n["name"]: n["id"] for n in nodes}
         logger.info(f"Cached {len(self._label_cache)} team labels")
+
+    def fetch_team_members(self):
+        """Cache team members: display name (lowercased) → Linear user ID.
+        Uses JSON cache to avoid re-fetching within TEAM_MEMBERS_TTL."""
+        if not self._team_uuid:
+            logger.error("Team not resolved. Call resolve_team() first.")
+            return
+
+        # Check persistent cache first
+        cached = self._cache.get("team_members", TEAM_MEMBERS_TTL)
+        if cached:
+            self._user_cache = cached
+            logger.info(f"Loaded {len(self._user_cache)} team member lookup keys from cache")
+            return
+
+        query = """
+        query {
+          team(id: "%s") {
+            members {
+              nodes { id displayName email }
+            }
+          }
+        }
+        """ % self._team_uuid
+
+        data = self._gql(query)
+        nodes = self._safe_get(data, "data", "team", "members", "nodes") or []
+        self._user_cache = {}
+        for member in nodes:
+            name = (member.get("displayName") or "").strip().lower()
+            if name:
+                self._user_cache[name] = member["id"]
+            # Also index by first part of email (before @) for fallback matching
+            email = (member.get("email") or "").strip().lower()
+            if email and "@" in email:
+                email_prefix = email.split("@")[0]
+                if email_prefix not in self._user_cache:
+                    self._user_cache[email_prefix] = member["id"]
+
+        # Persist to JSON cache
+        self._cache.set("team_members", self._user_cache)
+        logger.info(f"Cached {len(nodes)} team member(s) ({len(self._user_cache)} lookup keys)")
+
+    def _resolve_github_to_linear_user(self, github_username: str) -> str | None:
+        """Try to map a GitHub username to a Linear user ID via display name matching."""
+        username_lower = github_username.strip().lower()
+        # Direct match on display name or email prefix
+        if username_lower in self._user_cache:
+            return self._user_cache[username_lower]
+        # Substring match — e.g. GitHub "FazalulAbid" matching Linear "Fazalul Abid"
+        for name, uid in self._user_cache.items():
+            if username_lower in name or name in username_lower:
+                return uid
+        return None
+
+    def fetch_user_recent_issues(self, github_username: str) -> list[dict]:
+        """
+        Fetch recent issues for a GitHub user (mapped to Linear user).
+        Returns list of {identifier, title, state} dicts for Gemini context.
+        Falls back to recent team issues if user can't be mapped.
+        Results are cached per user for USER_ISSUES_TTL seconds.
+        """
+        cache_key = f"user_issues:{github_username.lower()}"
+
+        # Check cache first
+        cached = self._cache.get(cache_key, USER_ISSUES_TTL)
+        if cached is not None:
+            logger.debug(f"Cache hit for {github_username}'s recent issues ({len(cached)} issues)")
+            return cached
+
+        linear_user_id = self._resolve_github_to_linear_user(github_username)
+
+        if linear_user_id:
+            logger.debug(f"Mapped GitHub '{github_username}' → Linear user {linear_user_id}")
+            query = """
+            query {
+              issues(
+                filter: {
+                  assignee: { id: { eq: "%s" } }
+                  team: { id: { eq: "%s" } }
+                }
+                orderBy: updatedAt
+                first: 15
+              ) {
+                nodes { identifier title state { name } }
+              }
+            }
+            """ % (linear_user_id, self._team_uuid)
+        else:
+            logger.debug(
+                f"Could not map GitHub '{github_username}' to Linear user. "
+                f"Falling back to recent team issues."
+            )
+            query = """
+            query {
+              issues(
+                filter: {
+                  team: { id: { eq: "%s" } }
+                }
+                orderBy: updatedAt
+                first: 10
+              ) {
+                nodes { identifier title state { name } }
+              }
+            }
+            """ % self._team_uuid
+
+        data = self._gql(query)
+        nodes = self._safe_get(data, "data", "issues", "nodes") or []
+
+        results = []
+        for node in nodes:
+            state_name = self._safe_get(node, "state", "name") or "Unknown"
+            results.append({
+                "identifier": node.get("identifier", ""),
+                "title": node.get("title", ""),
+                "state": state_name,
+            })
+
+        # Persist to cache
+        self._cache.set(cache_key, results)
+
+        logger.info(
+            f"Fetched {len(results)} recent issue(s) for "
+            f"{'user ' + github_username if linear_user_id else 'team (fallback)'}"
+        )
+        return results
 
     # --- Execute action based on Gemini result ---
 
@@ -120,7 +282,7 @@ class LinearAgent:
         """
         variables = {
             "input": {
-                "teamId": self._team_id,
+                "teamId": self._team_uuid,
                 "title": result.title,
                 "description": result.description,
                 "priority": result.priority,
@@ -129,7 +291,7 @@ class LinearAgent:
         }
 
         data = self._gql(mutation, variables)
-        issue_data = data.get("data", {}).get("issueCreate", {})
+        issue_data = self._safe_get(data, "data", "issueCreate") or {}
 
         if issue_data.get("success"):
             issue = issue_data["issue"]
@@ -179,7 +341,7 @@ class LinearAgent:
         """
         variables = {
             "input": {
-                "teamId": self._team_id,
+                "teamId": self._team_uuid,
                 "title": result.title,
                 "description": result.description,
                 "priority": result.priority,
@@ -189,7 +351,7 @@ class LinearAgent:
         }
 
         data = self._gql(mutation, variables)
-        issue_data = data.get("data", {}).get("issueCreate", {})
+        issue_data = self._safe_get(data, "data", "issueCreate") or {}
 
         if issue_data.get("success"):
             issue = issue_data["issue"]
@@ -256,7 +418,7 @@ class LinearAgent:
         }
 
         data = self._gql(mutation, variables)
-        update_data = data.get("data", {}).get("issueUpdate", {})
+        update_data = self._safe_get(data, "data", "issueUpdate") or {}
 
         if update_data.get("success"):
             logger.info(f"Updated issue {result.existing_issue_id}: {result.title}")
@@ -287,7 +449,7 @@ class LinearAgent:
         """ % identifier
 
         data = self._gql(query)
-        issue = data.get("data", {}).get("issue")
+        issue = self._safe_get(data, "data", "issue")
         return issue["id"] if issue else None
 
     def _verify_auto_sync_label(self, identifier: str) -> bool:
@@ -301,11 +463,11 @@ class LinearAgent:
         """ % identifier
 
         data = self._gql(query)
-        issue = data.get("data", {}).get("issue")
+        issue = self._safe_get(data, "data", "issue")
         if not issue:
             return False
-        labels = [n["name"] for n in issue.get("labels", {}).get("nodes", [])]
-        return AUTO_SYNC_LABEL_NAME in labels
+        nodes = self._safe_get(issue, "labels", "nodes") or []
+        return any(n.get("name") == AUTO_SYNC_LABEL_NAME for n in nodes)
 
     def _get_issue_description(self, issue_uuid: str) -> str:
         """Fetch current description of an issue."""
@@ -318,8 +480,21 @@ class LinearAgent:
         """ % issue_uuid
 
         data = self._gql(query)
-        issue = data.get("data", {}).get("issue")
-        return issue.get("description", "") if issue else ""
+        issue = self._safe_get(data, "data", "issue")
+        return (issue.get("description") or "") if issue else ""
+
+    @staticmethod
+    def _safe_get(data: dict | None, *keys):
+        """
+        Safely traverse nested dicts where any value could be None.
+        Returns None if any key is missing or any intermediate value is None.
+        """
+        current = data
+        for key in keys:
+            if not isinstance(current, dict):
+                return None
+            current = current.get(key)
+        return current
 
     def _gql(self, query: str, variables: dict | None = None) -> dict:
         """Execute a GraphQL request against Linear API."""
@@ -334,4 +509,11 @@ class LinearAgent:
             timeout=15,
         )
         resp.raise_for_status()
-        return resp.json()
+        result = resp.json()
+
+        # Log GraphQL-level errors
+        if result.get("errors"):
+            for err in result["errors"]:
+                logger.warning(f"Linear GraphQL error: {err.get('message', err)}")
+
+        return result

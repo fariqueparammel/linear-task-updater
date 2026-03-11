@@ -265,7 +265,71 @@ def main():
 
 ---
 
-## 6. Additional Features
+## 6. Per-User Task Correlation
+
+When a new commit arrives, the system correlates it with the commit author's recent Linear tasks to determine whether it's related to existing work or represents new work.
+
+### Flow
+```
+New commit arrives
+    → Extract author (GitHub username)
+    → LinearAgent.fetch_user_recent_issues(author) — get user's recent tasks
+    → GeminiAgent.classify(batch, created_issues, user_recent_issues)
+        → Gemini sees the commit + user's active tasks
+        → If related to an existing task → ADD_SUBTASK or UPDATE_EXISTING
+        → If unrelated → CREATE_NEW
+    → LinearAgent.execute(result)
+```
+
+### 6A. User Mapping: GitHub → Linear
+
+The `LinearAgent` queries Linear for team members and builds a mapping of GitHub usernames to Linear user IDs. This mapping is cached on startup and used to fetch per-user issues.
+
+- **`fetch_team_members()`**: Query `team.members` to get `{displayName, email, id}` for all team members.
+- **`_github_to_linear_user`**: Dict mapping GitHub username → Linear user ID. Matched by display name (case-insensitive). Falls back to fetching all recent team issues if no user match is found.
+
+### 6B. Per-User Recent Issues
+
+- **`fetch_user_recent_issues(github_username)`**: Given a GitHub username, look up the Linear user ID and fetch their issues updated in the last 14 days.
+- Returns a list of `{identifier, title, state}` tuples that Gemini can compare against.
+- If the user can't be mapped, falls back to returning the last 10 team-wide issues.
+
+### 6C. Enhanced Gemini Prompt
+
+The Gemini system prompt now includes a new section:
+
+```
+The commit author's recent Linear tasks (to check for related work):
+  - LAT-45: "Refactor notification system" (In Progress)
+  - LAT-42: "Fix login crash on Android 14" (Done)
+  ...
+
+If the commit is clearly a continuation of or related to one of the author's
+recent tasks, use ADD_SUBTASK (setting parent_issue_id) or UPDATE_EXISTING
+(setting existing_issue_id). Only reference issue identifiers from the
+script-created issues list OR the author's recent tasks list.
+```
+
+### 6D. Critical Task Override
+
+If Gemini determines a commit is **critical** (priority 1 = Urgent), the batch size requirement is overridden:
+
+- The GeminiResult now includes an `is_critical: bool` field.
+- When `is_critical` is true, the orchestrator processes the commit immediately — even if the buffer hasn't reached `BATCH_SIZE`.
+- The buffer agent exposes `has_critical()` to check if any buffered commit was flagged as potentially critical (commit message contains keywords like "hotfix", "critical", "urgent", "security", "CVE", "crash", "breaking").
+
+### Decision Matrix
+
+| Scenario | Action | Batch Override? |
+|---|---|---|
+| Commit unrelated to user's tasks | CREATE_NEW | No |
+| Commit related to user's active task | ADD_SUBTASK | No |
+| Commit continues work on script-owned task | UPDATE_EXISTING | No |
+| Any commit flagged as critical/urgent | Any action above | **Yes** — process immediately |
+
+---
+
+## 7. Additional Features
 
 | Feature | Description |
 |---|---|
@@ -276,10 +340,13 @@ def main():
 | **Created-issues context** | Gemini receives the list of script-created issues so it can suggest `UPDATE_EXISTING` or `ADD_SUBTASK` for known tasks. |
 | **Atomic state writes** | Write to temp file then rename — prevents corruption on crash. |
 | **Issue ownership guard** | Double-check (local registry + Linear label) before any update. |
+| **Per-user correlation** | Each commit is correlated with the author's recent Linear tasks via Gemini. |
+| **Critical task override** | Commits with hotfix/critical/urgent keywords bypass batch threshold and process immediately. |
+| **Key × Model rotation** | 3 API keys × 5 Gemini models = 15 unique rate limit slots for maximum free-tier throughput. |
 
 ---
 
-## 7. Dependencies
+## 8. Dependencies
 
 ```
 PyGithub>=2.1.1
@@ -289,7 +356,7 @@ python-dotenv>=1.0.0
 
 ---
 
-## 8. File Structure
+## 9. File Structure
 
 ```
 linear_update/

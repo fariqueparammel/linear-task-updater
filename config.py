@@ -22,7 +22,17 @@ GEMINI_KEYS = [
         os.getenv("GEMINI_API_KEY_3"),
     ] if k
 ]
-GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+
+# Models to rotate through (all free-tier text-out models)
+# 3 keys × 5 models = 15 slots before repeating
+GEMINI_MODELS = [
+    "gemini-2.0-flash",           # solid, fast
+    "gemini-2.5-flash",           # newer, good quality
+    "gemini-2.5-flash-lite",      # lightweight, 10 RPM
+    "gemini-2.0-flash-lite",      # lightweight
+    "gemini-3.1-flash-lite",      # 15 RPM, 500 RPD — best for volume
+]
 
 # --- Tuning ---
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
