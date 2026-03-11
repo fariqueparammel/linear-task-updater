@@ -3,7 +3,6 @@ services:
     build: .
     container_name: linear-sync-engine
     restart: unless-stopped
-    user: "${UID:-1000}:${GID:-1000}"
     env_file:
       - .env
     volumes:
