@@ -13,6 +13,7 @@ logger = logging.getLogger("state")
 USER_ISSUES_TTL = 600       # 10 minutes — user's recent issues
 TEAM_MEMBERS_TTL = 3600     # 1 hour — team member mapping
 STALE_CLEANUP_INTERVAL = 300  # 5 minutes — how often to auto-purge
+LLM_CLEANUP_INTERVAL = 3600  # 1 hour — how often to run LLM-driven cleanup
 
 
 class StateManager:
@@ -106,6 +107,7 @@ class CacheManager:
         os.makedirs(cache_dir, exist_ok=True)
         self._cache_path = os.path.join(cache_dir, "cache.json")
         self._last_cleanup = 0.0
+        self._last_llm_cleanup = 0.0
 
     def _load(self) -> dict:
         if not os.path.exists(self._cache_path):
@@ -199,3 +201,68 @@ class CacheManager:
             "oldest_age": int(max(ages)),
             "newest_age": int(min(ages)),
         }
+
+    def get_entries_summary(self) -> list[dict]:
+        """Return a summary of all cache entries for LLM-driven cleanup."""
+        cache = self._load()
+        now = time.time()
+        entries = []
+        for key, val in cache.items():
+            age_seconds = int(now - val.get("ts", 0))
+            data = val.get("data")
+            # Provide a size/type hint without dumping full data
+            if isinstance(data, list):
+                data_hint = f"list with {len(data)} items"
+            elif isinstance(data, dict):
+                data_hint = f"dict with {len(data)} keys"
+            else:
+                data_hint = type(data).__name__
+            entries.append({
+                "key": key,
+                "age_seconds": age_seconds,
+                "age_human": _format_age(age_seconds),
+                "data_type": data_hint,
+            })
+        return entries
+
+    def should_run_llm_cleanup(self) -> bool:
+        """Check if enough time has passed for an LLM-driven cache review."""
+        now = time.time()
+        if now - self._last_llm_cleanup < LLM_CLEANUP_INTERVAL:
+            return False
+        # Only worth running if there are entries to review
+        cache = self._load()
+        return len(cache) > 0
+
+    def mark_llm_cleanup_done(self):
+        """Record that LLM cleanup was just performed."""
+        self._last_llm_cleanup = time.time()
+
+    def remove_keys(self, keys: list[str]) -> int:
+        """Remove specific keys from the cache. Returns count removed."""
+        cache = self._load()
+        removed = 0
+        for key in keys:
+            if key in cache:
+                del cache[key]
+                removed += 1
+        if removed > 0:
+            self._save(cache)
+            logger.info(f"LLM cache cleanup: removed {removed} entries: {keys}")
+        return removed
+
+
+def _format_age(seconds: int) -> str:
+    """Format seconds into a human-readable age string."""
+    if seconds < 60:
+        return f"{seconds}s"
+    elif seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    elif seconds < 86400:
+        hours = seconds // 3600
+        mins = (seconds % 3600) // 60
+        return f"{hours}h {mins}m"
+    else:
+        days = seconds // 86400
+        hours = (seconds % 86400) // 3600
+        return f"{days}d {hours}h"

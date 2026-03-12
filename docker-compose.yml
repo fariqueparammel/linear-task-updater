@@ -8,3 +8,13 @@ services:
     volumes:
       - ./state:/app/state
       - ./logs:/app/logs
+    develop:
+      watch:
+        - action: rebuild
+          path: .
+          ignore:
+            - state/
+            - logs/
+            - .env
+            - "*.md"
+            - .git/

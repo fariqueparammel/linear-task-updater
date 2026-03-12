@@ -26,16 +26,44 @@ Respond with ONLY a valid JSON object, no markdown fences, no explanation.
   "title": "concise task title (max 80 chars)",
   "description": "bullet-point summary of the commits",
   "priority": 0-4,
-  "label": "Bug" | "Feature" | "Improvement" | "Chore" | "Refactor",
-  "state": "Todo" | "In Progress" | "Done",
+  "label": "<one of the valid labels listed below>",
+  "state": "<one of the valid workflow states listed below>",
+  "assignee": "<exact displayName of the team member to assign this to, or null>",
+  "project": "<one of the active project names listed below, or null>",
   "parent_issue_id": "TEAM-123 or null",
   "existing_issue_id": "TEAM-456 or null",
   "is_critical": true | false
 }
 
-Priority scale: 0=No priority, 1=Urgent, 2=High, 3=Medium, 4=Low.
+=== FIELD RULES ===
 
-Decision rules:
+Priority (REQUIRED — integer 0-4):
+  0 = No priority, 1 = Urgent, 2 = High, 3 = Medium, 4 = Low.
+  Choose based on commit impact: hotfixes/security → 1, features → 3, chores → 4.
+
+Label (REQUIRED — must be from the valid labels list):
+  Pick the label that best categorizes the work. If none fit perfectly, pick the \
+closest match. Do NOT invent labels.
+
+State (REQUIRED — must be from the valid workflow states list):
+  For new tasks from commits, use an in-progress or to-do state. \
+Do NOT use "Done" unless the commit explicitly indicates completion.
+
+Assignee (REQUIRED — must be an exact team member displayName):
+  You MUST assign the task to the person who made the commit.
+  The commit provides the GitHub username. The team member list provides Linear \
+display names and emails. Match the GitHub username to the correct team member \
+using name similarity, email prefix, or process of elimination.
+  The assignee value MUST be the EXACT displayName from the team member list. \
+Do NOT invent names. If you cannot determine the correct assignee, set to null.
+  Use elimination: if only one team member's name/email could plausibly match \
+the GitHub username, pick that person.
+
+Project (OPTIONAL — pick from the active projects list if applicable):
+  If the commit work clearly relates to one of the active projects, set the \
+project name. Otherwise set to null. Do NOT invent project names.
+
+=== DECISION RULES ===
 - CREATE_NEW: Commits introduce new work not tied to any existing tracked task.
 - ADD_SUBTASK: Commits are clearly a sub-part of a larger tracked task. You MUST \
 set parent_issue_id to one of the known issue identifiers listed below.
@@ -47,7 +75,7 @@ the list of script-created issues OR the commit author's recent tasks listed bel
 - Set is_critical to true ONLY if the commit is a hotfix, security patch, \
 crash fix, or addresses a breaking/urgent production issue. Otherwise false.
 
-Per-user correlation:
+=== PER-USER CORRELATION ===
 - You will also receive the commit author's recent Linear tasks.
 - If the commit message is clearly related to one of the author's recent tasks \
 (same feature area, same component, continuation of work), prefer ADD_SUBTASK \
@@ -98,18 +126,30 @@ class GeminiAgent:
 
     def __init__(self, keys: list[str]):
         self._slot_manager = SlotManager(keys, config.GEMINI_MODELS)
+        self._improvement_agent = None  # Set via set_improvement_agent()
+        self._context_additions = ""    # Active learned rules appended to prompt
+
+    def set_improvement_agent(self, improvement_agent):
+        """Inject the ImprovementAgent for self-improving prompts."""
+        self._improvement_agent = improvement_agent
+        self._context_additions = improvement_agent.get_active_context_additions()
+        if self._context_additions:
+            logger.info(f"Loaded {len(improvement_agent.get_active_improvements())} learned rules into prompt")
 
     def classify(
         self,
         commits: list[CommitInfo],
         created_issues: list[LinearIssueRecord],
         user_recent_issues: list[dict] | None = None,
+        workspace_context: dict | None = None,
     ) -> GeminiResult | None:
         """
         Send a commit batch to Gemini and get a classification result.
         Returns None if all retries fail.
         """
-        user_prompt = self._build_user_prompt(commits, created_issues, user_recent_issues)
+        user_prompt = self._build_user_prompt(
+            commits, created_issues, user_recent_issues, workspace_context
+        )
         logger.info(f"Classifying batch of {len(commits)} commit(s) with Gemini")
 
         for attempt in range(MAX_RETRIES):
@@ -151,11 +191,14 @@ class GeminiAgent:
         key, model = self._slot_manager.get()
         url = f"{config.GEMINI_API_BASE}/{model}:generateContent?key={key}"
 
+        # Combine base prompt with any learned rules from ImprovementAgent
+        full_system_prompt = SYSTEM_PROMPT + self._context_additions
+
         payload = {
             "contents": [
                 {
                     "parts": [
-                        {"text": SYSTEM_PROMPT},
+                        {"text": full_system_prompt},
                         {"text": user_prompt},
                     ]
                 }
@@ -201,14 +244,54 @@ class GeminiAgent:
         commits: list[CommitInfo],
         created_issues: list[LinearIssueRecord],
         user_recent_issues: list[dict] | None = None,
+        workspace_context: dict | None = None,
     ) -> str:
-        """Format commits, known issues, and user's recent tasks into the user prompt."""
+        """Format commits, known issues, workspace context, and user's recent tasks."""
         lines = ["Recent commits to classify:\n"]
         for i, c in enumerate(commits, 1):
             lines.append(
                 f"Commit {i} (by {c.author}, repo: {c.repo}, {c.timestamp}):\n{c.message}\n"
             )
 
+        # Workspace metadata — valid values for Gemini to pick from
+        if workspace_context:
+            members = workspace_context.get("members", [])
+            if members:
+                lines.append("\n=== TEAM MEMBERS (use EXACT displayName for assignee) ===")
+                for m in members:
+                    email_part = f" ({m['email']})" if m.get("email") else ""
+                    lines.append(f"  - {m['displayName']}{email_part}")
+                # Remind about matching
+                author = commits[0].author if commits else "unknown"
+                lines.append(
+                    f"\nThe commit author's GitHub username is \"{author}\". "
+                    f"Match this to one of the team members above. "
+                    f"Use name similarity, email prefix, or elimination to determine "
+                    f"the correct assignee. The assignee MUST be an exact displayName from above."
+                )
+
+            states = workspace_context.get("workflow_states", [])
+            if states:
+                lines.append(f"\n=== VALID WORKFLOW STATES (use one of these for \"state\") ===")
+                lines.append(f"  {', '.join(states)}")
+
+            labels = workspace_context.get("labels", [])
+            if labels:
+                lines.append(f"\n=== VALID LABELS (use one of these for \"label\") ===")
+                lines.append(f"  {', '.join(labels)}")
+
+            projects = workspace_context.get("projects", [])
+            if projects:
+                lines.append(f"\n=== ACTIVE PROJECTS (use one for \"project\", or null) ===")
+                lines.append(f"  {', '.join(projects)}")
+
+            cycles = workspace_context.get("cycles", [])
+            if cycles:
+                active_note = " (auto-assigned to current cycle)" if workspace_context.get("has_active_cycle") else ""
+                lines.append(f"\n=== CYCLES{active_note} ===")
+                lines.append(f"  {', '.join(cycles)}")
+
+        # Script-created issues
         if created_issues:
             lines.append("\nKnown script-created Linear issues:")
             for issue in created_issues[-20:]:
@@ -216,8 +299,8 @@ class GeminiAgent:
         else:
             lines.append("\nNo existing script-created issues yet.")
 
+        # User's recent tasks for correlation
         if user_recent_issues:
-            # Deduce author from first commit
             author = commits[0].author if commits else "unknown"
             lines.append(f"\nCommit author ({author})'s recent Linear tasks:")
             for issue in user_recent_issues:
@@ -231,4 +314,91 @@ class GeminiAgent:
         else:
             lines.append("\nNo recent tasks found for the commit author.")
 
+        return "\n".join(lines)
+
+    def evaluate_cache_cleanup(self, entries: list[dict]) -> list[str]:
+        """
+        Ask Gemini which cache entries should be purged.
+        Returns list of cache keys to remove.
+        """
+        if not entries:
+            return []
+
+        prompt = self._build_cache_cleanup_prompt(entries)
+
+        try:
+            key, model = self._slot_manager.get()
+            url = f"{config.GEMINI_API_BASE}/{model}:generateContent?key={key}"
+
+            system = (
+                "You are a cache management AI. You analyze cached data entries and decide "
+                "which ones are stale and should be removed to keep the cache efficient.\n\n"
+                "Respond with ONLY a valid JSON object:\n"
+                '{"remove": ["key1", "key2"], "reason": "brief explanation"}\n\n'
+                "Rules:\n"
+                "- KEEP entries that are frequently refreshed (user_issues:*, team_members*) "
+                "if they are less than 2 hours old — they will be re-fetched naturally.\n"
+                "- REMOVE entries older than 6 hours — they are likely stale.\n"
+                "- REMOVE user_issues:* entries older than 30 minutes — user context changes fast.\n"
+                "- KEEP team_members and team_members_detail if under 2 hours — expensive to re-fetch.\n"
+                "- If all entries are fresh and useful, return {\"remove\": [], \"reason\": \"all entries are fresh\"}.\n"
+                "- Be conservative: when in doubt, keep the entry."
+            )
+
+            payload = {
+                "contents": [{"parts": [{"text": system}, {"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "responseMimeType": "application/json",
+                },
+            }
+
+            resp = requests.post(url, json=payload, timeout=15)
+            resp.raise_for_status()
+
+            data = resp.json()
+            text = (
+                data.get("candidates", [{}])[0]
+                .get("content", {})
+                .get("parts", [{}])[0]
+                .get("text", "")
+            )
+
+            if not text:
+                return []
+
+            text = text.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[-1]
+            if text.endswith("```"):
+                text = text.rsplit("```", 1)[0]
+
+            parsed = json.loads(text.strip())
+            keys_to_remove = parsed.get("remove", [])
+            reason = parsed.get("reason", "no reason given")
+
+            if keys_to_remove:
+                logger.info(f"LLM cache review: removing {len(keys_to_remove)} entries — {reason}")
+            else:
+                logger.debug(f"LLM cache review: no entries to remove — {reason}")
+
+            return keys_to_remove
+
+        except Exception as e:
+            logger.warning(f"LLM cache cleanup failed (non-critical): {e}")
+            return []
+
+    @staticmethod
+    def _build_cache_cleanup_prompt(entries: list[dict]) -> str:
+        """Format cache entries for the LLM to review."""
+        lines = [
+            f"Current cache has {len(entries)} entries. Review each and decide which to remove:\n"
+        ]
+        for e in entries:
+            lines.append(
+                f"  - key=\"{e['key']}\" | age={e['age_human']} ({e['age_seconds']}s) | type={e['data_type']}"
+            )
+        lines.append(
+            "\nReturn the keys that should be removed as a JSON array in the 'remove' field."
+        )
         return "\n".join(lines)

@@ -14,28 +14,30 @@ LINEAR_API_KEY = os.getenv("LINEAR_API_KEY", "")
 LINEAR_TEAM_ID = os.getenv("LINEAR_TEAM_ID", "")
 LINEAR_API_URL = "https://api.linear.app/graphql"
 
-# --- Gemini (3 keys for rotation) ---
+# --- Gemini (6 keys for rotation) ---
 GEMINI_KEYS = [
     k for k in [
         os.getenv("GEMINI_API_KEY_1"),
         os.getenv("GEMINI_API_KEY_2"),
         os.getenv("GEMINI_API_KEY_3"),
+        os.getenv("GEMINI_API_KEY_4"),
+        os.getenv("GEMINI_API_KEY_5"),
+        os.getenv("GEMINI_API_KEY_6"),
     ] if k
 ]
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
-# Models to rotate through (all free-tier text-out models)
-# 3 keys × 5 models = 15 slots before repeating
+# Models to rotate through (only models with non-zero RPD on free tier)
+# 6 keys × 4 models = 24 slots before repeating
 GEMINI_MODELS = [
-    "gemini-2.0-flash",           # solid, fast
-    "gemini-2.5-flash",           # newer, good quality
-    "gemini-2.5-flash-lite",      # lightweight, 10 RPM
-    "gemini-2.0-flash-lite",      # lightweight
-    "gemini-3.1-flash-lite",      # 15 RPM, 500 RPD — best for volume
+    "gemini-3-flash-preview",     # Gemini 3 Flash, 5 RPM, 20 RPD
+    "gemini-3.1-flash-lite-preview",  # 15 RPM, 500 RPD — best for volume
+    "gemini-2.5-flash",           # 5 RPM, 20 RPD
+    "gemini-2.5-flash-lite",      # 10 RPM, 20 RPD
 ]
 
 # --- Tuning ---
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "120"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "3"))
 BATCH_TIMEOUT_SECONDS = int(os.getenv("BATCH_TIMEOUT_SECONDS", "3600"))
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"

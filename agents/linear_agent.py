@@ -36,7 +36,22 @@ class LinearAgent:
         self._auto_sync_label_id: str | None = None
         self._label_cache: dict[str, str] = {}  # name -> id
         self._user_cache: dict[str, str] = {}  # lowercase display name -> linear user id
+        self._state_cache: dict[str, str] = {}  # state name -> state id
+        self._project_cache: dict[str, str] = {}  # project name -> project id
+        self._cycle_cache: dict[str, str] = {}  # cycle name -> cycle id
+        self._active_cycle_id: str | None = None  # current active cycle UUID
+        self._members_detail: list[dict] = []  # [{id, displayName, email}] for Gemini context
         self._cache = CacheManager()
+        self._mapping_agent = None  # Set via set_mapping_agent()
+        self._github_agent = None   # Set via set_github_agent()
+
+    def set_mapping_agent(self, mapping_agent):
+        """Inject the MappingAgent for AI-powered user resolution fallback."""
+        self._mapping_agent = mapping_agent
+
+    def set_github_agent(self, github_agent):
+        """Inject the GitHubAgent for commit author lookups during backfill."""
+        self._github_agent = github_agent
 
     # --- Setup (run once on startup) ---
 
@@ -125,6 +140,86 @@ class LinearAgent:
         self._label_cache = {n["name"]: n["id"] for n in nodes}
         logger.info(f"Cached {len(self._label_cache)} team labels")
 
+    def fetch_workflow_states(self):
+        """Cache workflow states for the team (name → id mapping)."""
+        if not self._team_uuid:
+            return
+
+        query = """
+        query {
+          workflowStates(filter: { team: { id: { eq: "%s" } } }) {
+            nodes { id name type }
+          }
+        }
+        """ % self._team_uuid
+
+        data = self._gql(query)
+        nodes = self._safe_get(data, "data", "workflowStates", "nodes") or []
+        self._state_cache = {n["name"]: n["id"] for n in nodes}
+        state_names = [f"{n['name']} ({n['type']})" for n in nodes]
+        logger.info(f"Cached {len(self._state_cache)} workflow states: {', '.join(state_names)}")
+
+    def fetch_projects(self):
+        """Cache projects for the team (name → id mapping)."""
+        if not self._team_uuid:
+            return
+
+        query = """
+        query {
+          projects(
+            filter: { accessibleTeams: { id: { eq: "%s" } } }
+            first: 50
+          ) {
+            nodes { id name state }
+          }
+        }
+        """ % self._team_uuid
+
+        data = self._gql(query)
+        nodes = self._safe_get(data, "data", "projects", "nodes") or []
+        # Only cache active projects (planned, started)
+        active = [n for n in nodes if n.get("state") in ("planned", "started", None)]
+        self._project_cache = {n["name"]: n["id"] for n in active}
+        logger.info(f"Cached {len(self._project_cache)} active project(s)")
+
+    def fetch_cycles(self):
+        """Cache active/upcoming cycles for the team. Auto-assigns to current active cycle."""
+        if not self._team_uuid:
+            return
+
+        # Query cycles through the team object (Linear API requires this path)
+        query = """
+        query {
+          team(id: "%s") {
+            cycles(first: 10) {
+              nodes { id name number startsAt endsAt }
+            }
+          }
+        }
+        """ % self._team_uuid
+
+        try:
+            data = self._gql(query)
+            nodes = self._safe_get(data, "data", "team", "cycles", "nodes") or []
+
+            now = datetime.now(timezone.utc).isoformat()
+
+            self._cycle_cache = {}
+            for n in nodes:
+                cycle_name = n.get("name") or f"Cycle {n.get('number', '?')}"
+                self._cycle_cache[cycle_name] = n["id"]
+                # Detect the currently active cycle
+                starts = n.get("startsAt", "")
+                ends = n.get("endsAt", "")
+                if starts and ends and starts <= now <= ends:
+                    self._active_cycle_id = n["id"]
+                    logger.info(f"Active cycle detected: {cycle_name} ({n['id'][:8]}...)")
+
+            logger.info(f"Cached {len(self._cycle_cache)} cycle(s), active={self._active_cycle_id is not None}")
+        except Exception as e:
+            logger.warning(f"Could not fetch cycles (non-critical): {e}")
+            self._cycle_cache = {}
+
     def fetch_team_members(self):
         """Cache team members: display name (lowercased) → Linear user ID.
         Uses JSON cache to avoid re-fetching within TEAM_MEMBERS_TTL."""
@@ -136,6 +231,7 @@ class LinearAgent:
         cached = self._cache.get("team_members", TEAM_MEMBERS_TTL)
         if cached:
             self._user_cache = cached
+            self._members_detail = self._cache.get("team_members_detail", TEAM_MEMBERS_TTL) or []
             logger.info(f"Loaded {len(self._user_cache)} team member lookup keys from cache")
             return
 
@@ -163,12 +259,143 @@ class LinearAgent:
                 if email_prefix not in self._user_cache:
                     self._user_cache[email_prefix] = member["id"]
 
+        # Store full detail list for Gemini context
+        self._members_detail = [
+            {
+                "id": m["id"],
+                "displayName": m.get("displayName", ""),
+                "email": m.get("email", ""),
+            }
+            for m in nodes
+        ]
+
         # Persist to JSON cache
         self._cache.set("team_members", self._user_cache)
+        self._cache.set("team_members_detail", self._members_detail)
         logger.info(f"Cached {len(nodes)} team member(s) ({len(self._user_cache)} lookup keys)")
 
+    def fetch_project_assignees(self) -> list[dict]:
+        """
+        Fetch who works on which project by checking recent issue assignees.
+        Returns list of {project, assignees: [displayName, ...]} for mapping context.
+        """
+        if not self._team_uuid or not self._project_cache:
+            return []
+
+        results = []
+        for project_name, project_id in list(self._project_cache.items())[:10]:
+            try:
+                query = """
+                query {
+                  issues(
+                    filter: {
+                      team: { id: { eq: "%s" } }
+                      project: { id: { eq: "%s" } }
+                    }
+                    first: 20
+                    orderBy: updatedAt
+                  ) {
+                    nodes {
+                      assignee { displayName }
+                    }
+                  }
+                }
+                """ % (self._team_uuid, project_id)
+
+                data = self._gql(query)
+                nodes = self._safe_get(data, "data", "issues", "nodes") or []
+
+                assignees = set()
+                for node in nodes:
+                    assignee = self._safe_get(node, "assignee", "displayName")
+                    if assignee:
+                        assignees.add(assignee)
+
+                if assignees:
+                    results.append({
+                        "project": project_name,
+                        "assignees": sorted(assignees),
+                    })
+            except Exception as e:
+                logger.debug(f"Could not fetch assignees for project '{project_name}': {e}")
+
+        logger.info(f"Fetched project assignees for {len(results)} project(s)")
+        return results
+
+    def get_workspace_context(self) -> dict:
+        """
+        Return workspace metadata for Gemini prompt context.
+        Includes team members, workflow states, labels, projects, and cycles.
+        """
+        return {
+            "members": [
+                {"displayName": m["displayName"], "email": m.get("email", "")}
+                for m in self._members_detail
+            ],
+            "workflow_states": list(self._state_cache.keys()),
+            "labels": list(self._label_cache.keys()),
+            "projects": list(self._project_cache.keys()),
+            "cycles": list(self._cycle_cache.keys()),
+            "has_active_cycle": self._active_cycle_id is not None,
+        }
+
+    def resolve_assignee_id(self, assignee_name: str | None) -> str | None:
+        """Resolve an assignee display name (from Gemini) to a Linear user UUID."""
+        if not assignee_name:
+            return None
+
+        name_lower = assignee_name.strip().lower()
+
+        # Direct match
+        if name_lower in self._user_cache:
+            return self._user_cache[name_lower]
+
+        # Substring / fuzzy match
+        for cached_name, uid in self._user_cache.items():
+            if name_lower in cached_name or cached_name in name_lower:
+                return uid
+
+        # Check against full member details (displayName exact match, case-insensitive)
+        for m in self._members_detail:
+            if m["displayName"].strip().lower() == name_lower:
+                return m["id"]
+
+        logger.warning(f"Could not resolve assignee '{assignee_name}' to a Linear user")
+        return None
+
+    def resolve_state_id(self, state_name: str | None) -> str | None:
+        """Resolve a workflow state name to its Linear UUID."""
+        if not state_name:
+            return None
+        # Exact match
+        if state_name in self._state_cache:
+            return self._state_cache[state_name]
+        # Case-insensitive match
+        name_lower = state_name.strip().lower()
+        for cached_name, sid in self._state_cache.items():
+            if cached_name.lower() == name_lower:
+                return sid
+        return None
+
+    def resolve_project_id(self, project_name: str | None) -> str | None:
+        """Resolve a project name to its Linear UUID."""
+        if not project_name:
+            return None
+        if project_name in self._project_cache:
+            return self._project_cache[project_name]
+        name_lower = project_name.strip().lower()
+        for cached_name, pid in self._project_cache.items():
+            if cached_name.lower() == name_lower:
+                return pid
+        return None
+
     def _resolve_github_to_linear_user(self, github_username: str) -> str | None:
-        """Try to map a GitHub username to a Linear user ID via display name matching."""
+        """
+        Map a GitHub username to a Linear user ID.
+        1. Direct name/email match
+        2. Substring match
+        3. MappingAgent AI-powered resolution (project context + elimination)
+        """
         username_lower = github_username.strip().lower()
         # Direct match on display name or email prefix
         if username_lower in self._user_cache:
@@ -177,6 +404,37 @@ class LinearAgent:
         for name, uid in self._user_cache.items():
             if username_lower in name or name in username_lower:
                 return uid
+
+        # Fallback: use MappingAgent with project context
+        if self._mapping_agent and self._members_detail:
+            logger.info(
+                f"Direct mapping failed for '{github_username}'. "
+                f"Invoking MappingAgent for AI-powered resolution..."
+            )
+            project_context = self.fetch_project_assignees()
+            known_mappings = self._mapping_agent.get_known_mappings()
+
+            result = self._mapping_agent.resolve(
+                github_username=github_username,
+                members_detail=self._members_detail,
+                project_context=project_context,
+                known_mappings=known_mappings if known_mappings else None,
+            )
+
+            if result and result.get("linear_user_id"):
+                # Cache the resolved mapping in _user_cache for future fast lookups
+                uid = result["linear_user_id"]
+                display_name = result["display_name"]
+                self._user_cache[username_lower] = uid
+                self._user_cache[display_name.lower()] = uid
+                # Persist updated user cache
+                self._cache.set("team_members", self._user_cache)
+                logger.info(
+                    f"MappingAgent resolved: '{github_username}' → "
+                    f"'{display_name}' ({uid[:8]}...)"
+                )
+                return uid
+
         return None
 
     def fetch_user_recent_issues(self, github_username: str) -> list[dict]:
@@ -252,18 +510,144 @@ class LinearAgent:
         )
         return results
 
+    # --- Backfill missing fields on previously created issues ---
+
+    def backfill_created_issues(self):
+        """
+        Check all script-created issues and update any that are missing
+        assignee, state, or cycle. For unassigned issues, resolves the
+        commit author to a Linear member using stored author or GitHub API lookup.
+        """
+        created_issues = self._state.get_created_issues()
+        if not created_issues:
+            logger.info("BACKFILL | No script-created issues to check")
+            return
+
+        logger.info(f"BACKFILL_START | Checking {len(created_issues)} script-created issue(s)")
+        updated_count = 0
+
+        for record in created_issues:
+            try:
+                # Fetch current issue details from Linear
+                query = """
+                query {
+                  issue(id: "%s") {
+                    id identifier
+                    assignee { id displayName }
+                    state { id name }
+                    cycle { id }
+                    project { id }
+                  }
+                }
+                """ % record.issue_id
+
+                data = self._gql(query)
+                issue = self._safe_get(data, "data", "issue")
+                if not issue:
+                    logger.debug(f"BACKFILL | Could not fetch {record.identifier}, skipping")
+                    continue
+
+                update_input = {}
+
+                # Check missing assignee — resolve commit author to Linear member
+                if not self._safe_get(issue, "assignee", "id"):
+                    assignee_id = self._resolve_backfill_assignee(record)
+                    if assignee_id:
+                        update_input["assigneeId"] = assignee_id
+
+                # Check missing cycle
+                if not self._safe_get(issue, "cycle", "id") and self._active_cycle_id:
+                    update_input["cycleId"] = self._active_cycle_id
+
+                # Check if state is default (Backlog) and could be improved
+                current_state = self._safe_get(issue, "state", "name")
+                if current_state == "Backlog":
+                    todo_id = self.resolve_state_id("Todo")
+                    if todo_id:
+                        update_input["stateId"] = todo_id
+
+                if not update_input:
+                    continue
+
+                mutation = """
+                mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
+                  issueUpdate(id: $id, input: $input) {
+                    success
+                    issue { id identifier }
+                  }
+                }
+                """
+                variables = {
+                    "id": record.issue_id,
+                    "input": update_input,
+                }
+
+                result = self._gql(mutation, variables)
+                success = self._safe_get(result, "data", "issueUpdate", "success")
+
+                if success:
+                    fields = list(update_input.keys())
+                    logger.info(
+                        f"BACKFILL_UPDATED | {record.identifier} | "
+                        f"fields={fields}"
+                    )
+                    updated_count += 1
+                else:
+                    logger.warning(f"BACKFILL_FAILED | {record.identifier}: {result}")
+
+            except Exception as e:
+                logger.warning(f"BACKFILL_ERROR | {record.identifier}: {e}")
+
+        logger.info(f"BACKFILL_COMPLETE | Updated {updated_count}/{len(created_issues)} issue(s)")
+
+    def _resolve_backfill_assignee(self, record) -> str | None:
+        """
+        Resolve the commit author for a previously created issue to a Linear user ID.
+        1. Use stored commit_author if available
+        2. Otherwise, look up the first source commit SHA via GitHub API
+        3. Map the GitHub username to a Linear member
+        """
+        github_username = record.commit_author
+
+        # If no stored author, try looking up via GitHub API
+        if not github_username and record.source_commits and self._github_agent:
+            for sha in record.source_commits[:3]:  # Try first 3 SHAs
+                try:
+                    github_username = self._github_agent.fetch_commit_author(sha)
+                    if github_username:
+                        logger.debug(
+                            f"BACKFILL | Found author '{github_username}' "
+                            f"for {record.identifier} via SHA {sha[:8]}"
+                        )
+                        break
+                except Exception as e:
+                    logger.debug(f"BACKFILL | SHA lookup failed for {sha[:8]}: {e}")
+
+        if not github_username:
+            logger.debug(f"BACKFILL | No author found for {record.identifier}, skipping assignee")
+            return None
+
+        # Resolve GitHub username to Linear user ID
+        linear_user_id = self._resolve_github_to_linear_user(github_username)
+        if linear_user_id:
+            logger.info(
+                f"BACKFILL_ASSIGNEE | {record.identifier} | "
+                f"github={github_username} → linear_user={linear_user_id[:8]}..."
+            )
+        return linear_user_id
+
     # --- Execute action based on Gemini result ---
 
-    def execute(self, result: GeminiResult, source_shas: list[str] | None = None):
+    def execute(self, result: GeminiResult, source_shas: list[str] | None = None, primary_author: str | None = None):
         """Route to the correct mutation based on action type."""
         if config.DRY_RUN:
             logger.info(f"[DRY RUN] Would execute {result.action}: {result.title}")
             return
 
         if result.action == "CREATE_NEW":
-            self._create_issue(result, source_shas or [])
+            self._create_issue(result, source_shas or [], primary_author)
         elif result.action == "ADD_SUBTASK":
-            self._create_subtask(result, source_shas or [])
+            self._create_subtask(result, source_shas or [], primary_author)
         elif result.action == "UPDATE_EXISTING":
             self._update_issue(result)
         else:
@@ -271,9 +655,12 @@ class LinearAgent:
 
     # --- Mutations ---
 
-    def _create_issue(self, result: GeminiResult, source_shas: list[str]):
+    def _create_issue(self, result: GeminiResult, source_shas: list[str], primary_author: str | None = None):
         """Create a new Linear issue with auto-sync label."""
         label_ids = self._resolve_label_ids(result.label)
+        assignee_id = self.resolve_assignee_id(result.assignee)
+        state_id = self.resolve_state_id(result.state)
+        project_id = self.resolve_project_id(result.project)
 
         mutation = """
         mutation IssueCreate($input: IssueCreateInput!) {
@@ -285,15 +672,24 @@ class LinearAgent:
         """
         description = result.description + BOT_SIGNATURE
 
-        variables = {
-            "input": {
-                "teamId": self._team_uuid,
-                "title": result.title,
-                "description": description,
-                "priority": result.priority,
-                "labelIds": label_ids,
-            }
+        input_vars = {
+            "teamId": self._team_uuid,
+            "title": result.title,
+            "description": description,
+            "priority": result.priority,
+            "labelIds": label_ids,
         }
+        if assignee_id:
+            input_vars["assigneeId"] = assignee_id
+        if state_id:
+            input_vars["stateId"] = state_id
+        if project_id:
+            input_vars["projectId"] = project_id
+        # Auto-assign to active cycle if one exists
+        if self._active_cycle_id:
+            input_vars["cycleId"] = self._active_cycle_id
+
+        variables = {"input": input_vars}
 
         data = self._gql(mutation, variables)
         issue_data = self._safe_get(data, "data", "issueCreate") or {}
@@ -306,17 +702,21 @@ class LinearAgent:
                 url=issue["url"],
                 created_at=datetime.now(timezone.utc).isoformat(),
                 source_commits=source_shas,
+                commit_author=primary_author,
             )
             self._state.add_created_issue(record)
+            assignee_info = f"assignee={result.assignee or 'unassigned'}"
+            project_info = f"project={result.project or 'none'}"
             logger.info(
-                f"LINEAR TASK CREATED by {BOT_NAME} | {issue['identifier']} | "
+                f"ISSUE_CREATED | {issue['identifier']} | "
                 f"\"{result.title}\" | priority={result.priority} | "
-                f"label={result.label} | url={issue['url']}"
+                f"label={result.label} | state={result.state} | "
+                f"{assignee_info} | {project_info} | url={issue['url']}"
             )
         else:
-            logger.error(f"Failed to create issue: {data}")
+            logger.error(f"ISSUE_CREATE_FAILED | {result.title} | {data}")
 
-    def _create_subtask(self, result: GeminiResult, source_shas: list[str]):
+    def _create_subtask(self, result: GeminiResult, source_shas: list[str], primary_author: str | None = None):
         """Create a sub-issue under a parent. Parent must be script-owned."""
         if not result.parent_issue_id:
             logger.error("ADD_SUBTASK but no parent_issue_id. Falling back to CREATE_NEW.")
@@ -339,6 +739,9 @@ class LinearAgent:
             return
 
         label_ids = self._resolve_label_ids(result.label)
+        assignee_id = self.resolve_assignee_id(result.assignee)
+        state_id = self.resolve_state_id(result.state)
+        project_id = self.resolve_project_id(result.project)
 
         mutation = """
         mutation IssueCreate($input: IssueCreateInput!) {
@@ -350,16 +753,24 @@ class LinearAgent:
         """
         description = result.description + BOT_SIGNATURE
 
-        variables = {
-            "input": {
-                "teamId": self._team_uuid,
-                "title": result.title,
-                "description": description,
-                "priority": result.priority,
-                "labelIds": label_ids,
-                "parentId": parent_uuid,
-            }
+        input_vars = {
+            "teamId": self._team_uuid,
+            "title": result.title,
+            "description": description,
+            "priority": result.priority,
+            "labelIds": label_ids,
+            "parentId": parent_uuid,
         }
+        if assignee_id:
+            input_vars["assigneeId"] = assignee_id
+        if state_id:
+            input_vars["stateId"] = state_id
+        if project_id:
+            input_vars["projectId"] = project_id
+        if self._active_cycle_id:
+            input_vars["cycleId"] = self._active_cycle_id
+
+        variables = {"input": input_vars}
 
         data = self._gql(mutation, variables)
         issue_data = self._safe_get(data, "data", "issueCreate") or {}
@@ -372,16 +783,20 @@ class LinearAgent:
                 url=issue["url"],
                 created_at=datetime.now(timezone.utc).isoformat(),
                 source_commits=source_shas,
+                commit_author=primary_author,
             )
             self._state.add_created_issue(record)
+            assignee_info = f"assignee={result.assignee or 'unassigned'}"
+            project_info = f"project={result.project or 'none'}"
             logger.info(
-                f"LINEAR SUBTASK CREATED by {BOT_NAME} | {issue['identifier']} | "
+                f"SUBTASK_CREATED | {issue['identifier']} | "
                 f"parent={result.parent_issue_id} | "
                 f"\"{result.title}\" | priority={result.priority} | "
-                f"label={result.label} | url={issue['url']}"
+                f"label={result.label} | state={result.state} | "
+                f"{assignee_info} | {project_info} | url={issue['url']}"
             )
         else:
-            logger.error(f"Failed to create subtask: {data}")
+            logger.error(f"SUBTASK_CREATE_FAILED | parent={result.parent_issue_id} | {result.title} | {data}")
 
     def _update_issue(self, result: GeminiResult):
         """Update an existing issue. Must be script-owned (double-checked)."""
@@ -415,6 +830,9 @@ class LinearAgent:
         separator = f"\n\n---\n_Updated by **{BOT_NAME}**:_\n"
         new_desc = (existing_desc or "") + separator + result.description
 
+        assignee_id = self.resolve_assignee_id(result.assignee)
+        state_id = self.resolve_state_id(result.state)
+
         mutation = """
         mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
           issueUpdate(id: $id, input: $input) {
@@ -423,25 +841,33 @@ class LinearAgent:
           }
         }
         """
+        update_input = {
+            "description": new_desc,
+            "priority": result.priority,
+        }
+        if assignee_id:
+            update_input["assigneeId"] = assignee_id
+        if state_id:
+            update_input["stateId"] = state_id
+
         variables = {
             "id": issue_uuid,
-            "input": {
-                "description": new_desc,
-                "priority": result.priority,
-            },
+            "input": update_input,
         }
 
         data = self._gql(mutation, variables)
         update_data = self._safe_get(data, "data", "issueUpdate") or {}
 
         if update_data.get("success"):
+            assignee_info = f"assignee={result.assignee or 'unchanged'}"
             logger.info(
-                f"LINEAR TASK UPDATED by {BOT_NAME} | {result.existing_issue_id} | "
+                f"ISSUE_UPDATED | {result.existing_issue_id} | "
                 f"\"{result.title}\" | priority={result.priority} | "
-                f"label={result.label}"
+                f"label={result.label} | state={result.state} | "
+                f"{assignee_info}"
             )
         else:
-            logger.error(f"Failed to update issue: {data}")
+            logger.error(f"ISSUE_UPDATE_FAILED | {result.existing_issue_id} | {result.title} | {data}")
 
     # --- Helpers ---
 

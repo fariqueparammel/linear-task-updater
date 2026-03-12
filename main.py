@@ -11,8 +11,11 @@ import time
 import logging
 
 import config
-from state import StateManager
-from agents import GitHubAgent, BufferAgent, GeminiAgent, LinearAgent
+from state import StateManager, CacheManager
+from agents import (
+    GitHubAgent, BufferAgent, GeminiAgent, LinearAgent,
+    MappingAgent, ImprovementAgent,
+)
 
 logger = logging.getLogger("orchestrator")
 
@@ -47,64 +50,159 @@ def main():
 
     # 2. Init agents
     state = StateManager()
+    cache = CacheManager()
     github = GitHubAgent(config.GITHUB_TOKEN, config.GITHUB_ORG)
     buffer = BufferAgent(state)
     gemini = GeminiAgent(config.GEMINI_KEYS)
     linear = LinearAgent(config.LINEAR_API_KEY, config.LINEAR_TEAM_ID, state)
+    mapping = MappingAgent(config.GEMINI_KEYS, cache)
+    improvement = ImprovementAgent(config.GEMINI_KEYS, cache)
+    linear.set_mapping_agent(mapping)
+    linear.set_github_agent(github)
+    gemini.set_improvement_agent(improvement)
 
     # 3. One-time setup — resolve team key to UUID
     linear.resolve_team()
     if not linear._team_uuid:
         logger.error("Could not resolve Linear team. Check LINEAR_TEAM_ID in .env")
         return
-    linear.ensure_auto_sync_label()
-    linear.fetch_team_labels()
-    linear.fetch_team_members()
+    # Each setup step is wrapped so a single failure doesn't block startup
+    for setup_name, setup_fn in [
+        ("ensure_auto_sync_label", linear.ensure_auto_sync_label),
+        ("fetch_team_labels", linear.fetch_team_labels),
+        ("fetch_workflow_states", linear.fetch_workflow_states),
+        ("fetch_projects", linear.fetch_projects),
+        ("fetch_cycles", linear.fetch_cycles),
+        ("fetch_team_members", linear.fetch_team_members),
+    ]:
+        try:
+            setup_fn()
+        except Exception as e:
+            logger.error(f"SETUP_ERROR | {setup_name} failed: {e}", exc_info=True)
 
-    # 4. Main loop
+    ws = linear.get_workspace_context()
+    logger.info(
+        f"Workspace context ready: {len(ws.get('members', []))} members, "
+        f"{len(ws.get('workflow_states', []))} states, "
+        f"{len(ws.get('labels', []))} labels, "
+        f"{len(ws.get('projects', []))} projects"
+    )
+
+    # 4. Backfill: update previously created issues missing assignee/state/cycle
+    try:
+        linear.backfill_created_issues()
+    except Exception as e:
+        logger.error(f"BACKFILL_STARTUP_ERROR | {e}", exc_info=True)
+
+    # 5. Main loop
     while not _shutdown:
         try:
-            repo_shas = state.get_repo_shas()
+            # --- Step A: Fetch new commits from GitHub ---
+            new_commits = []
+            try:
+                repo_shas = state.get_repo_shas()
+                new_commits, updated_shas = github.fetch_all_org_commits(repo_shas)
+                if updated_shas:
+                    state.update_repo_shas(updated_shas)
+            except Exception as e:
+                logger.error(f"FETCH_COMMITS_ERROR | {e}", exc_info=True)
 
-            # Fetch new commits from all org repos
-            new_commits, updated_shas = github.fetch_all_org_commits(repo_shas)
+            # --- Step B: Buffer new commits ---
+            try:
+                if new_commits:
+                    for c in new_commits:
+                        logger.info(
+                            f"COMMIT_FOUND | repo={c.repo} | author={c.author} | "
+                            f"sha={c.sha[:8]} | \"{c.message.splitlines()[0][:80]}\""
+                        )
+                    buffer.add_commits(new_commits)
+            except Exception as e:
+                logger.error(f"BUFFER_ERROR | {e}", exc_info=True)
 
-            # Always save SHA positions (even on first run with 0 new commits)
-            if updated_shas:
-                state.update_repo_shas(updated_shas)
-
-            # Buffer new commits
-            if new_commits:
-                buffer.add_commits(new_commits)
-
-            # Process all ready batches (one at a time with cooldown)
+            # --- Step C: Process ready batches ---
             while buffer.is_ready() and not _shutdown:
-                batch = buffer.get_batch()
-                created_issues = state.get_created_issues()
+                batch = None
+                try:
+                    batch = buffer.get_batch()
+                    created_issues = state.get_created_issues()
 
-                # Per-user correlation: fetch the commit author's recent Linear tasks
-                primary_author = batch[0].author if batch else None
-                user_recent_issues = None
-                if primary_author:
-                    user_recent_issues = linear.fetch_user_recent_issues(primary_author)
+                    # Per-user correlation
+                    primary_author = batch[0].author if batch else None
+                    user_recent_issues = None
+                    if primary_author:
+                        try:
+                            user_recent_issues = linear.fetch_user_recent_issues(primary_author)
+                        except Exception as e:
+                            logger.warning(f"USER_ISSUES_ERROR | author={primary_author} | {e}")
 
-                result = gemini.classify(batch, created_issues, user_recent_issues)
+                    workspace_context = linear.get_workspace_context()
+                    result = gemini.classify(
+                        batch, created_issues, user_recent_issues, workspace_context
+                    )
 
-                if result:
-                    source_shas = [c.sha for c in batch]
-                    linear.execute(result, source_shas)
+                    if result:
+                        source_shas = [c.sha for c in batch]
+                        try:
+                            linear.execute(result, source_shas, primary_author)
+                        except Exception as e:
+                            logger.error(f"LINEAR_EXECUTE_ERROR | {result.action} | {result.title} | {e}", exc_info=True)
 
-                buffer.clear_batch(batch)
+                        # Track classification for self-improvement
+                        try:
+                            improvement.record_classification(
+                                task_identifier=result.title[:30],
+                                gemini_result={
+                                    "action": result.action,
+                                    "priority": result.priority,
+                                    "label": result.label,
+                                    "state": result.state,
+                                    "assignee": result.assignee,
+                                    "project": result.project,
+                                },
+                            )
+                        except Exception as e:
+                            logger.warning(f"IMPROVEMENT_TRACK_ERROR | {e}")
+
+                except Exception as e:
+                    logger.error(f"BATCH_PROCESS_ERROR | {e}", exc_info=True)
+                finally:
+                    # Always clear the batch to prevent infinite retry loops
+                    if batch:
+                        try:
+                            buffer.clear_batch(batch)
+                        except Exception as e:
+                            logger.error(f"BATCH_CLEAR_ERROR | {e}")
 
                 # Cooldown between Gemini calls to respect rate limits
                 if buffer.is_ready():
                     logger.debug("Cooling down 10s before next batch...")
                     time.sleep(10)
 
+            # --- Step D: Periodic self-improvement ---
+            try:
+                if improvement.should_attempt_improvement():
+                    from agents.gemini_agent import SYSTEM_PROMPT
+                    improvement.generate_improvement(SYSTEM_PROMPT)
+                    gemini.set_improvement_agent(improvement)
+            except Exception as e:
+                logger.warning(f"IMPROVEMENT_ERROR | {e}")
+
+            # --- Step E: Periodic LLM-driven cache cleanup ---
+            try:
+                if cache.should_run_llm_cleanup():
+                    entries = cache.get_entries_summary()
+                    if entries:
+                        keys_to_remove = gemini.evaluate_cache_cleanup(entries)
+                        if keys_to_remove:
+                            cache.remove_keys(keys_to_remove)
+                    cache.mark_llm_cleanup_done()
+            except Exception as e:
+                logger.warning(f"CACHE_CLEANUP_ERROR | {e}")
+
         except KeyboardInterrupt:
             break
         except Exception as e:
-            logger.error(f"Error in main loop: {e}", exc_info=True)
+            logger.error(f"MAIN_LOOP_ERROR | {e}", exc_info=True)
 
         # Sleep in small increments so shutdown is responsive
         for _ in range(config.POLL_INTERVAL_SECONDS):

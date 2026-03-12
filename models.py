@@ -26,9 +26,11 @@ class GeminiResult:
     priority: int                      # 0-4
     label: str                         # Bug, Feature, Improvement, Chore, Refactor
     state: str                         # Todo, In Progress, Done
+    project: str | None = None             # Project name chosen by Gemini
     parent_issue_id: str | None = None
     existing_issue_id: str | None = None
     is_critical: bool = False
+    assignee: str | None = None            # Linear display name chosen by Gemini
 
     VALID_ACTIONS = {"CREATE_NEW", "ADD_SUBTASK", "UPDATE_EXISTING"}
     VALID_LABELS = {"Bug", "Feature", "Improvement", "Chore", "Refactor"}
@@ -58,9 +60,11 @@ class GeminiResult:
             priority=int(d.get("priority", 3)),
             label=d.get("label", "Chore"),
             state=d.get("state", "Todo"),
+            project=d.get("project"),
             parent_issue_id=d.get("parent_issue_id"),
             existing_issue_id=d.get("existing_issue_id"),
             is_critical=bool(d.get("is_critical", False)),
+            assignee=d.get("assignee"),
         )
 
 
@@ -71,10 +75,18 @@ class LinearIssueRecord:
     url: str
     created_at: str
     source_commits: list[str] = field(default_factory=list)
+    commit_author: str | None = None  # GitHub username of the primary commit author
 
     def to_dict(self):
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "LinearIssueRecord":
-        return cls(**d)
+        return cls(
+            issue_id=d["issue_id"],
+            identifier=d["identifier"],
+            url=d["url"],
+            created_at=d["created_at"],
+            source_commits=d.get("source_commits", []),
+            commit_author=d.get("commit_author"),
+        )

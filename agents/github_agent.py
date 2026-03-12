@@ -143,6 +143,27 @@ class GitHubAgent:
 
         return all_commits, updated_shas
 
+    def fetch_commit_author(self, sha: str) -> str | None:
+        """
+        Look up the author of a commit by SHA across the org.
+        Uses GitHub search API to find the commit without knowing the repo.
+        Returns the GitHub username or None.
+        """
+        try:
+            commits = self._gh.search_commits(query=f"hash:{sha} org:{self._org_name}")
+            for commit in commits:
+                if commit.author:
+                    return commit.author.login
+                elif commit.commit and commit.commit.author:
+                    return commit.commit.author.name
+            return None
+        except GithubException as e:
+            logger.debug(f"Could not look up commit {sha[:8]}: {e}")
+            return None
+        except Exception as e:
+            logger.debug(f"Commit lookup failed for {sha[:8]}: {e}")
+            return None
+
     def _to_commit_info(self, commit, repo, branch: str) -> CommitInfo:
         author_name = "unknown"
         if commit.author:
