@@ -76,11 +76,16 @@ the list of script-created issues OR the commit author's recent tasks listed bel
 crash fix, or addresses a breaking/urgent production issue. Otherwise false.
 
 === PER-USER CORRELATION ===
-- You will also receive the commit author's recent Linear tasks.
-- If the commit message is clearly related to one of the author's recent tasks \
+- You will receive ONLY the commit author's own tasks (both script-created and \
+their recent Linear tasks). You will NOT see other users' tasks.
+- For ADD_SUBTASK or UPDATE_EXISTING, you may ONLY reference task identifiers \
+from the lists provided below — these are exclusively the commit author's tasks.
+- If the commit is clearly related to one of the author's existing tasks \
 (same feature area, same component, continuation of work), prefer ADD_SUBTASK \
 with that task as parent, or UPDATE_EXISTING if the task was script-created.
-- If the commit is unrelated to any of the author's recent tasks, use CREATE_NEW.
+- If the commit is unrelated to any of the author's tasks, use CREATE_NEW.
+- NEVER reference a task identifier that is not in the provided lists — it may \
+belong to another user.
 """
 
 MAX_RETRIES = 8
@@ -291,18 +296,19 @@ class GeminiAgent:
                 lines.append(f"\n=== CYCLES{active_note} ===")
                 lines.append(f"  {', '.join(cycles)}")
 
-        # Script-created issues
+        # Script-created issues (filtered to this author only)
+        author = commits[0].author if commits else "unknown"
         if created_issues:
-            lines.append("\nKnown script-created Linear issues:")
+            lines.append(f"\nScript-created issues by {author} (author's own tasks only):")
             for issue in created_issues[-20:]:
-                lines.append(f"  - {issue.identifier}: {issue.url}")
+                title_part = f" \"{issue.title}\"" if issue.title else ""
+                lines.append(f"  - {issue.identifier}:{title_part} {issue.url}")
         else:
-            lines.append("\nNo existing script-created issues yet.")
+            lines.append(f"\nNo script-created issues by {author} yet.")
 
         # User's recent tasks for correlation
         if user_recent_issues:
-            author = commits[0].author if commits else "unknown"
-            lines.append(f"\nCommit author ({author})'s recent Linear tasks:")
+            lines.append(f"\n{author}'s recent Linear tasks (author's own tasks only):")
             for issue in user_recent_issues:
                 lines.append(
                     f"  - {issue['identifier']}: \"{issue['title']}\" ({issue['state']})"

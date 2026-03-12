@@ -5,13 +5,14 @@ Automated multi-agent service that monitors all repositories in a GitHub organiz
 ## How It Works
 
 ```
-GitHub Commits → Buffer → Gemini AI Classification → Guard (spam check) → Linear Issue Creation
-                           (6 keys × 4 models)        (zero LLM cost)      (assignee, state, project, cycle, label, priority)
+GitHub Commits → Buffer → Per-User Filter → Gemini AI Classification → Guard (spam check) → Linear Issue Creation
+                           (author's tasks     (N keys × 4 models)        (zero LLM cost)      (assignee, state, project,
+                            only to Gemini)                                                       cycle, label, priority)
 ```
 
 1. **Fetches** new commits from every repo in your GitHub org (read-only)
 2. **Buffers** them until 3 commits accumulate (or 1 hour timeout). Critical commits (hotfix/security) process immediately
-3. **Classifies** the batch with Gemini AI using full workspace context (team members, labels, states, projects, cycles)
+3. **Classifies** the batch with Gemini AI using full workspace context — only the commit author's own tasks are shown to Gemini (per-user isolation)
 4. **Guards** against spam — blocks duplicate commits, similar titles, rate limit violations, and generic titles (zero LLM cost)
 5. **Creates/updates** Linear issues with all fields resolved: assignee, workflow state, project, cycle, labels, priority
 6. **Self-improves** — tracks classification accuracy and iteratively refines the AI prompt after 20 consecutive correct results
@@ -33,7 +34,7 @@ main.py (Orchestrator)
 
 - **GitHub**: Read-only. Never writes to any repo
 - **Linear**: Only modifies issues it created (tagged `auto-sync`). Never deletes issues. Double-checked before every update (local registry + label verification)
-- **Gemini**: 6-key × 4-model rotation (24 rate limit slots). Exponential backoff on 429s
+- **Gemini**: N-key × 4-model rotation (N×4 rate limit slots). Exponential backoff on 429s
 - **Resilient**: Every step independently error-handled — a single failure never crashes the service
 
 ## Prerequisites
@@ -157,7 +158,7 @@ State and logs persist on the host in `./state/` and `./logs/`.
 | **Backfill with assignee resolution** | On startup, unassigned issues get their commit author looked up and mapped to a Linear member |
 | **Spam/duplicate guard** | GuardAgent blocks duplicate commits, similar titles, rate limit violations, and generic titles before Linear execution — zero LLM cost |
 | **Critical commit override** | Commits containing hotfix/security/urgent/CVE/crash keywords bypass batch threshold and process immediately (see [`cheat_sheet.md`](cheat_sheet.md)) |
-| **Per-user task correlation** | Commits are correlated with the author's recent Linear tasks to decide CREATE_NEW vs ADD_SUBTASK vs UPDATE_EXISTING |
+| **Per-user task correlation** | Gemini only sees the commit author's own tasks — other users' tasks are never shown. Ownership validation prevents cross-user updates with automatic CREATE_NEW fallback |
 | **Key × Model rotation** | N API keys × 4 models = N×4 unique rate limit slots before any repeat (unlimited keys supported) |
 | **Resilient error handling** | Every sub-step independently wrapped — a GitHub API failure doesn't block Linear updates, a Gemini timeout doesn't crash the loop |
 | **Periodic workspace refresh** | Projects, workflow states, labels, cycles, and members are re-fetched every 30 min to pick up new items (`WORKSPACE_REFRESH_SECONDS`) |
@@ -177,6 +178,7 @@ BACKFILL_ASSIGNEE | Author resolved for unassigned issue
 BACKFILL_COMPLETE | Backfill finished
 MAPPING RESOLVED  | GitHub → Linear user mapping found
 GUARD_BLOCKED   | Spam/duplicate detected, issue creation skipped
+OWNERSHIP_MISMATCH | Target issue belongs to different author, fell back to CREATE_NEW
 WORKSPACE_REFRESH | Workspace data re-fetched (projects, states, labels, cycles, members)
 ```
 
@@ -247,7 +249,7 @@ linear_update/
 | `Missing required environment variables` | Copy `.env.example` to `.env` and fill in all keys |
 | GitHub `401 Unauthorized` | Regenerate your `GITHUB_TOKEN` with `read:org` + `repo` scopes |
 | GitHub returns 0 repos | Verify `GITHUB_ORG` matches your org name exactly |
-| Gemini `429 Too Many Requests` | Add more Gemini API keys (up to 6). The script rotates through all key×model combinations |
+| Gemini `429 Too Many Requests` | Add more Gemini API keys (no limit). The script rotates through all key×model combinations |
 | Gemini `404 Not Found` | A model may have been deprecated. Check `config.py` for current model list |
 | Linear `Authentication failed` | Check `LINEAR_API_KEY` and `LINEAR_TEAM_ID` are correct |
 | No issues being created | Check `logs/sync.log` for errors. Try `DRY_RUN=true` first to see what would happen |

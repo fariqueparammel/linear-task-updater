@@ -803,6 +803,21 @@ class LinearAgent:
             logger.info(f"[DRY RUN] Would execute {result.action}: {result.title}")
             return
 
+        # Per-user ownership: for UPDATE/SUBTASK, verify target belongs to same author
+        if primary_author and result.action in ("UPDATE_EXISTING", "ADD_SUBTASK"):
+            target_id = result.existing_issue_id if result.action == "UPDATE_EXISTING" else result.parent_issue_id
+            if target_id:
+                target_record = self._state.get_issue_by_identifier(target_id)
+                if target_record and target_record.commit_author and target_record.commit_author != primary_author:
+                    logger.warning(
+                        f"OWNERSHIP_MISMATCH | {result.action} targets {target_id} "
+                        f"(owner={target_record.commit_author}) but commit author is "
+                        f"{primary_author}. Falling back to CREATE_NEW."
+                    )
+                    result.action = "CREATE_NEW"
+                    result.existing_issue_id = None
+                    result.parent_issue_id = None
+
         if result.action == "CREATE_NEW":
             self._create_issue(result, source_shas or [], primary_author)
         elif result.action == "ADD_SUBTASK":

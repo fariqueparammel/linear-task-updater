@@ -126,28 +126,35 @@ def main():
                 batch = None
                 try:
                     batch = buffer.get_batch()
-                    created_issues = state.get_created_issues()
+                    all_created_issues = state.get_created_issues()
 
-                    # Per-user correlation
+                    # Per-user correlation — only show the author's own tasks to Gemini
                     primary_author = batch[0].author if batch else None
                     user_recent_issues = None
                     if primary_author:
+                        author_created_issues = [
+                            i for i in all_created_issues
+                            if i.commit_author == primary_author
+                        ]
                         try:
                             user_recent_issues = linear.fetch_user_recent_issues(primary_author)
                         except Exception as e:
                             logger.warning(f"USER_ISSUES_ERROR | author={primary_author} | {e}")
+                    else:
+                        author_created_issues = all_created_issues
 
                     workspace_context = linear.get_workspace_context()
                     result = gemini.classify(
-                        batch, created_issues, user_recent_issues, workspace_context
+                        batch, author_created_issues, user_recent_issues, workspace_context
                     )
 
                     if result:
                         source_shas = [c.sha for c in batch]
 
                         # Guard check — block spam/duplicates before Linear execution
+                        # Guard uses ALL issues (SHA dedup must check across all users)
                         verdict = guard.evaluate(
-                            result, source_shas, list(created_issues.values()),
+                            result, source_shas, all_created_issues,
                             user_recent_issues, primary_author
                         )
                         if not verdict:
