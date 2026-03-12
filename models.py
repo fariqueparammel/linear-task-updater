@@ -76,6 +76,7 @@ class LinearIssueRecord:
     created_at: str
     source_commits: list[str] = field(default_factory=list)
     commit_author: str | None = None  # GitHub username of the primary commit author
+    title: str = ""  # Stored for GuardAgent title similarity checks
 
     def to_dict(self):
         return asdict(self)
@@ -89,4 +90,16 @@ class LinearIssueRecord:
             created_at=d["created_at"],
             source_commits=d.get("source_commits", []),
             commit_author=d.get("commit_author"),
+            title=d.get("title", ""),
         )
+
+
+@dataclass
+class GuardVerdict:
+    """Result of spam/duplicate detection check."""
+    allowed: bool          # True = pass through, False = blocked
+    reason: str            # Human-readable reason (empty if allowed)
+    check_name: str        # "sha_duplicate", "title_similarity", "rate_limit", "generic_title", "passed"
+
+    def __bool__(self):
+        return self.allowed

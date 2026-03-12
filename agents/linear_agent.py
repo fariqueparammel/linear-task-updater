@@ -514,57 +514,49 @@ class LinearAgent:
 
     def backfill_created_issues(self):
         """
-        Check all script-created issues and update any that are missing
-        assignee, state, or cycle. For unassigned issues, resolves the
-        commit author to a Linear member using stored author or GitHub API lookup.
+        Check ALL auto-sync labeled issues in Linear (not just local registry)
+        and update any that are missing assignee, state, cycle, or project.
+        Also registers any discovered issues not in the local state.
         """
-        created_issues = self._state.get_created_issues()
-        if not created_issues:
-            logger.info("BACKFILL | No script-created issues to check")
+        # Gather issues from both sources: local registry + Linear scan
+        issues_to_check = self._gather_backfill_issues()
+        if not issues_to_check:
+            logger.info("BACKFILL | No auto-sync issues to check")
             return
 
-        logger.info(f"BACKFILL_START | Checking {len(created_issues)} script-created issue(s)")
+        logger.info(f"BACKFILL_START | Checking {len(issues_to_check)} auto-sync issue(s)")
         updated_count = 0
 
-        for record in created_issues:
+        for issue_info in issues_to_check:
             try:
-                # Fetch current issue details from Linear
-                query = """
-                query {
-                  issue(id: "%s") {
-                    id identifier
-                    assignee { id displayName }
-                    state { id name }
-                    cycle { id }
-                    project { id }
-                  }
-                }
-                """ % record.issue_id
-
-                data = self._gql(query)
-                issue = self._safe_get(data, "data", "issue")
-                if not issue:
-                    logger.debug(f"BACKFILL | Could not fetch {record.identifier}, skipping")
-                    continue
-
+                issue_id = issue_info["id"]
+                identifier = issue_info["identifier"]
                 update_input = {}
 
-                # Check missing assignee — resolve commit author to Linear member
-                if not self._safe_get(issue, "assignee", "id"):
-                    assignee_id = self._resolve_backfill_assignee(record)
+                # Check missing assignee
+                if not issue_info.get("assignee_id"):
+                    assignee_id = self._resolve_backfill_assignee_from_info(issue_info)
                     if assignee_id:
                         update_input["assigneeId"] = assignee_id
 
                 # Check missing cycle
-                if not self._safe_get(issue, "cycle", "id") and self._active_cycle_id:
+                if not issue_info.get("cycle_id") and self._active_cycle_id:
                     update_input["cycleId"] = self._active_cycle_id
 
-                # Check if state is default (Backlog) and could be improved
-                current_state = self._safe_get(issue, "state", "name")
-                if current_state == "Backlog":
+                # Check if state is default (Backlog)
+                if issue_info.get("state_name") == "Backlog":
                     todo_id = self.resolve_state_id("Todo")
                     if todo_id:
                         update_input["stateId"] = todo_id
+
+                # Check missing project — deduce from title/description
+                if not issue_info.get("project_id") and self._project_cache:
+                    project_id = self._deduce_project(
+                        issue_info.get("title", ""),
+                        issue_info.get("description", ""),
+                    )
+                    if project_id:
+                        update_input["projectId"] = project_id
 
                 if not update_input:
                     continue
@@ -577,64 +569,231 @@ class LinearAgent:
                   }
                 }
                 """
-                variables = {
-                    "id": record.issue_id,
-                    "input": update_input,
-                }
+                variables = {"id": issue_id, "input": update_input}
 
                 result = self._gql(mutation, variables)
                 success = self._safe_get(result, "data", "issueUpdate", "success")
 
                 if success:
                     fields = list(update_input.keys())
-                    logger.info(
-                        f"BACKFILL_UPDATED | {record.identifier} | "
-                        f"fields={fields}"
-                    )
+                    logger.info(f"BACKFILL_UPDATED | {identifier} | fields={fields}")
                     updated_count += 1
                 else:
-                    logger.warning(f"BACKFILL_FAILED | {record.identifier}: {result}")
+                    logger.warning(f"BACKFILL_FAILED | {identifier}: {result}")
 
             except Exception as e:
-                logger.warning(f"BACKFILL_ERROR | {record.identifier}: {e}")
+                logger.warning(f"BACKFILL_ERROR | {issue_info.get('identifier', '?')}: {e}")
 
-        logger.info(f"BACKFILL_COMPLETE | Updated {updated_count}/{len(created_issues)} issue(s)")
+        logger.info(f"BACKFILL_COMPLETE | Updated {updated_count}/{len(issues_to_check)} issue(s)")
 
-    def _resolve_backfill_assignee(self, record) -> str | None:
+    def _gather_backfill_issues(self) -> list[dict]:
         """
-        Resolve the commit author for a previously created issue to a Linear user ID.
+        Gather all auto-sync issues from both the local registry and Linear.
+        Returns normalized list of dicts with issue details.
+        Registers any Linear-discovered issues not in local state.
+        """
+        seen_ids = set()
+        issues = []
+
+        # Source 1: Local registry (has commit_author + source_commits)
+        for record in self._state.get_created_issues():
+            try:
+                query = """
+                query {
+                  issue(id: "%s") {
+                    id identifier title description
+                    assignee { id displayName }
+                    state { id name }
+                    cycle { id }
+                    project { id }
+                  }
+                }
+                """ % record.issue_id
+
+                data = self._gql(query)
+                issue = self._safe_get(data, "data", "issue")
+                if not issue:
+                    continue
+
+                seen_ids.add(issue["id"])
+                issues.append({
+                    "id": issue["id"],
+                    "identifier": issue.get("identifier", record.identifier),
+                    "title": issue.get("title", ""),
+                    "description": issue.get("description", ""),
+                    "assignee_id": self._safe_get(issue, "assignee", "id"),
+                    "state_name": self._safe_get(issue, "state", "name"),
+                    "cycle_id": self._safe_get(issue, "cycle", "id"),
+                    "project_id": self._safe_get(issue, "project", "id"),
+                    "commit_author": record.commit_author,
+                    "source_commits": record.source_commits,
+                })
+            except Exception as e:
+                logger.debug(f"BACKFILL | Could not fetch {record.identifier}: {e}")
+
+        # Source 2: Scan Linear for auto-sync labeled issues not in local registry
+        if self._auto_sync_label_id and self._team_uuid:
+            try:
+                query = """
+                query {
+                  issues(
+                    filter: {
+                      team: { id: { eq: "%s" } }
+                      labels: { id: { eq: "%s" } }
+                    }
+                    first: 50
+                    orderBy: createdAt
+                  ) {
+                    nodes {
+                      id identifier title description
+                      assignee { id displayName }
+                      state { id name }
+                      cycle { id }
+                      project { id }
+                    }
+                  }
+                }
+                """ % (self._team_uuid, self._auto_sync_label_id)
+
+                data = self._gql(query)
+                nodes = self._safe_get(data, "data", "issues", "nodes") or []
+
+                new_discoveries = 0
+                for issue in nodes:
+                    if issue["id"] in seen_ids:
+                        continue
+
+                    seen_ids.add(issue["id"])
+                    issues.append({
+                        "id": issue["id"],
+                        "identifier": issue.get("identifier", "?"),
+                        "title": issue.get("title", ""),
+                        "description": issue.get("description", ""),
+                        "assignee_id": self._safe_get(issue, "assignee", "id"),
+                        "state_name": self._safe_get(issue, "state", "name"),
+                        "cycle_id": self._safe_get(issue, "cycle", "id"),
+                        "project_id": self._safe_get(issue, "project", "id"),
+                        "commit_author": None,
+                        "source_commits": [],
+                    })
+
+                    # Register in local state so future backfills are faster
+                    record = LinearIssueRecord(
+                        issue_id=issue["id"],
+                        identifier=issue.get("identifier", "?"),
+                        url=f"https://linear.app/issue/{issue.get('identifier', '')}",
+                        created_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                    self._state.add_created_issue(record)
+                    new_discoveries += 1
+
+                if new_discoveries:
+                    logger.info(
+                        f"BACKFILL_DISCOVERED | Found {new_discoveries} auto-sync issue(s) "
+                        f"not in local registry — registered"
+                    )
+            except Exception as e:
+                logger.warning(f"BACKFILL | Linear scan failed (non-critical): {e}")
+
+        return issues
+
+    def _resolve_backfill_assignee_from_info(self, issue_info: dict) -> str | None:
+        """
+        Resolve the assignee for a backfill issue.
         1. Use stored commit_author if available
-        2. Otherwise, look up the first source commit SHA via GitHub API
-        3. Map the GitHub username to a Linear member
+        2. Look up source commit SHAs via GitHub API
+        3. Try to extract author from the issue description (CommitPilot format)
+        4. Map the GitHub username to a Linear member
         """
-        github_username = record.commit_author
+        github_username = issue_info.get("commit_author")
 
-        # If no stored author, try looking up via GitHub API
-        if not github_username and record.source_commits and self._github_agent:
-            for sha in record.source_commits[:3]:  # Try first 3 SHAs
+        # Try GitHub SHA lookup
+        if not github_username and issue_info.get("source_commits") and self._github_agent:
+            for sha in issue_info["source_commits"][:3]:
                 try:
                     github_username = self._github_agent.fetch_commit_author(sha)
                     if github_username:
                         logger.debug(
                             f"BACKFILL | Found author '{github_username}' "
-                            f"for {record.identifier} via SHA {sha[:8]}"
+                            f"for {issue_info['identifier']} via SHA {sha[:8]}"
                         )
                         break
-                except Exception as e:
-                    logger.debug(f"BACKFILL | SHA lookup failed for {sha[:8]}: {e}")
+                except Exception:
+                    pass
+
+        # Try extracting author from description (CommitPilot descriptions contain commit info)
+        if not github_username:
+            description = issue_info.get("description", "")
+            github_username = self._extract_author_from_description(description)
 
         if not github_username:
-            logger.debug(f"BACKFILL | No author found for {record.identifier}, skipping assignee")
+            logger.debug(
+                f"BACKFILL | No author found for {issue_info['identifier']}, skipping assignee"
+            )
             return None
 
-        # Resolve GitHub username to Linear user ID
         linear_user_id = self._resolve_github_to_linear_user(github_username)
         if linear_user_id:
             logger.info(
-                f"BACKFILL_ASSIGNEE | {record.identifier} | "
+                f"BACKFILL_ASSIGNEE | {issue_info['identifier']} | "
                 f"github={github_username} → linear_user={linear_user_id[:8]}..."
             )
         return linear_user_id
+
+    @staticmethod
+    def _extract_author_from_description(description: str) -> str | None:
+        """
+        Try to extract a GitHub username from a CommitPilot-generated description.
+        Looks for patterns like 'by username' or 'author: username' in the text.
+        """
+        if not description:
+            return None
+        import re
+        # Match patterns like "by FazalulAbid" or "Commit 1 (by username,"
+        match = re.search(r'\(by\s+(\w[\w-]*)', description)
+        if match:
+            return match.group(1)
+        # Match "author: username" or "Author: username"
+        match = re.search(r'[Aa]uthor[:\s]+(\w[\w-]*)', description)
+        if match:
+            return match.group(1)
+        return None
+
+    def _deduce_project(self, title: str, description: str) -> str | None:
+        """
+        Try to match an issue to a project based on title/description keywords.
+        Uses simple keyword matching against project names.
+        """
+        if not self._project_cache:
+            return None
+
+        text = (title + " " + (description or "")).lower()
+
+        best_match = None
+        best_score = 0
+
+        for project_name, project_id in self._project_cache.items():
+            # Split project name into keywords
+            keywords = project_name.lower().split()
+            # Count how many project name words appear in the issue text
+            score = sum(1 for kw in keywords if len(kw) > 2 and kw in text)
+            # Also check if the full project name appears
+            if project_name.lower() in text:
+                score += len(keywords) * 2  # Strong boost for full name match
+
+            if score > best_score:
+                best_score = score
+                best_match = (project_name, project_id)
+
+        # Require at least 1 keyword match (for single-word names) or 2+ for multi-word
+        if best_match:
+            project_name, project_id = best_match
+            min_score = 1 if len(project_name.split()) == 1 else 2
+            if best_score >= min_score:
+                logger.info(f"BACKFILL_PROJECT | Deduced project '{project_name}' (score={best_score})")
+                return project_id
+
+        return None
 
     # --- Execute action based on Gemini result ---
 
@@ -703,6 +862,7 @@ class LinearAgent:
                 created_at=datetime.now(timezone.utc).isoformat(),
                 source_commits=source_shas,
                 commit_author=primary_author,
+                title=result.title,
             )
             self._state.add_created_issue(record)
             assignee_info = f"assignee={result.assignee or 'unassigned'}"
@@ -784,6 +944,7 @@ class LinearAgent:
                 created_at=datetime.now(timezone.utc).isoformat(),
                 source_commits=source_shas,
                 commit_author=primary_author,
+                title=result.title,
             )
             self._state.add_created_issue(record)
             assignee_info = f"assignee={result.assignee or 'unassigned'}"

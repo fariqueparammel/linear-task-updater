@@ -4,8 +4,9 @@ from agents.gemini_agent import GeminiAgent
 from agents.linear_agent import LinearAgent
 from agents.mapping_agent import MappingAgent
 from agents.improvement_agent import ImprovementAgent
+from agents.guard_agent import GuardAgent
 
 __all__ = [
     "GitHubAgent", "BufferAgent", "GeminiAgent", "LinearAgent",
-    "MappingAgent", "ImprovementAgent",
+    "MappingAgent", "ImprovementAgent", "GuardAgent",
 ]

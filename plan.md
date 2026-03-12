@@ -27,7 +27,8 @@ main.py (Orchestrator)
       ├── gemini_agent.py      # AI classification with key×model rotation + cache cleanup
       ├── linear_agent.py      # SAFE: Creates/updates issues with full field assignment
       ├── mapping_agent.py     # AI-powered GitHub → Linear user resolution
-      └── improvement_agent.py # Self-improving prompt context system
+      ├── improvement_agent.py # Self-improving prompt context system
+      └── guard_agent.py       # Spam/duplicate detection gate (zero LLM cost)
 ```
 
 ### Data Flow
@@ -37,6 +38,7 @@ GitHubAgent.fetch_all_org_commits()
     → BufferAgent.is_ready()                     [critical override if hotfix/urgent]
     → LinearAgent.fetch_user_recent_issues()     [per-user correlation]
     → GeminiAgent.classify(batch, context)       [workspace-aware classification]
+    → GuardAgent.evaluate(result, shas, issues)  [spam/duplicate gate]
     → LinearAgent.execute(result, shas, author)  [ISSUE_CREATED/UPDATED logged]
     → ImprovementAgent.record_classification()   [accuracy tracking]
     → State.update()
@@ -55,13 +57,11 @@ GITHUB_ORG=your-org-name               # Organization name
 LINEAR_API_KEY=lin_api_xxxxxxxxxxxx    # Personal API key
 LINEAR_TEAM_ID=LAT                     # Team key or UUID
 
-# Gemini (6 keys for rotation)
+# Gemini (unlimited keys — add as many as you want for better rotation)
 GEMINI_API_KEY_1=AIzaSy...
 GEMINI_API_KEY_2=AIzaSy...
 GEMINI_API_KEY_3=AIzaSy...
-GEMINI_API_KEY_4=AIzaSy...
-GEMINI_API_KEY_5=AIzaSy...
-GEMINI_API_KEY_6=AIzaSy...
+# Add more: GEMINI_API_KEY_4, _5, _6, ... (no limit)
 
 # Tuning
 POLL_INTERVAL_SECONDS=120
@@ -78,13 +78,13 @@ DRY_RUN=false
 ### 4A. `config.py` — Configuration
 - Loads `.env` via `python-dotenv`.
 - Validates all required keys at startup (fail fast).
-- **6 API keys** for Gemini rotation.
+- **Unlimited API keys** for Gemini rotation — dynamically collects all `GEMINI_API_KEY_*` env vars.
 - **4 models** (only free-tier models with non-zero RPD):
   - `gemini-3-flash-preview` (5 RPM, 20 RPD)
   - `gemini-3.1-flash-lite-preview` (15 RPM, 500 RPD — best for volume)
   - `gemini-2.5-flash` (5 RPM, 20 RPD)
   - `gemini-2.5-flash-lite` (10 RPM, 20 RPD)
-- **6 keys × 4 models = 24 unique rate limit slots**.
+- **N keys × 4 models = N×4 unique rate limit slots**.
 - Default poll interval: 120 seconds.
 
 ### 4B. `models.py` — Data Models
@@ -111,6 +111,13 @@ class GeminiResult:
 class LinearIssueRecord:
     issue_id, identifier, url, created_at, source_commits
     commit_author: str | None  # GitHub username of primary commit author
+    title: str = ""            # Stored for GuardAgent title similarity checks
+
+@dataclass
+class GuardVerdict:
+    allowed: bool       # True = pass through, False = blocked
+    reason: str         # Human-readable reason (empty if allowed)
+    check_name: str     # "sha_duplicate", "title_similarity", "rate_limit", "generic_title", "passed"
 ```
 
 ### 4C. `state.py` — Persistent State + Cache
@@ -258,6 +265,30 @@ Tracks classification accuracy and iteratively improves the Gemini prompt contex
 - `improvement:candidate` — Current improvement candidate (7-day TTL)
 - `improvement:history` — All promoted improvements (permanent)
 
+### 4J. `agents/guard_agent.py` — Guard Agent (Zero-Cost Gate)
+
+Lightweight spam/duplicate detection agent that runs between Gemini classification and Linear execution. Uses ZERO LLM calls — pure string matching and rate checks.
+
+**Only evaluates CREATE_NEW actions** — ADD_SUBTASK and UPDATE_EXISTING always pass.
+
+**Checks (in order)**:
+
+| # | Check | What It Detects | Mechanism |
+|---|---|---|---|
+| 1 | SHA Duplicate | Same commit already created an issue | Set lookup against `created_issues[].source_commits` |
+| 2 | Title Similarity | Near-duplicate issue title | `difflib.SequenceMatcher` (threshold >= 0.82) against issues created in last 24h + user's recent issues |
+| 3 | Rate Limit | Author creating too many issues too fast | Count author's issues in last 1 hour (max 5) |
+| 4 | Generic Title | Vague/noise titles ("update code", "fix bug") | Regex pattern matching against known generic patterns + min 8 char length |
+
+**Thresholds**:
+- `TITLE_SIMILARITY_THRESHOLD = 0.82`
+- `TITLE_SIMILARITY_WINDOW = 86400` (24 hours)
+- `RATE_LIMIT_MAX_ISSUES = 5` per author
+- `RATE_LIMIT_WINDOW = 3600` (1 hour)
+- `MIN_TITLE_LENGTH = 8` characters
+
+**Returns**: `GuardVerdict(allowed, reason, check_name)` — blocks logged as `GUARD_BLOCKED | check=... | reason=... | title=...`
+
 ---
 
 ## 5. Orchestrator (`main.py`)
@@ -266,10 +297,11 @@ Tracks classification accuracy and iteratively improves the Gemini prompt contex
 def main():
     # 1. Config & logging
     # 2. Init agents: StateManager, CacheManager, GitHubAgent, BufferAgent,
-    #    GeminiAgent, LinearAgent, MappingAgent, ImprovementAgent
+    #    GeminiAgent, LinearAgent, MappingAgent, ImprovementAgent, GuardAgent
     #    - linear.set_mapping_agent(mapping)
     #    - linear.set_github_agent(github)
     #    - gemini.set_improvement_agent(improvement)
+    #    - guard = GuardAgent(state)
     # 3. One-time setup (each step wrapped in try/except):
     #    - resolve_team, ensure_auto_sync_label, fetch_team_labels
     #    - fetch_workflow_states, fetch_projects, fetch_cycles, fetch_team_members
@@ -280,11 +312,15 @@ def main():
     #    C. Process batches:
     #       - Per-user correlation: fetch author's recent Linear tasks
     #       - Classify with full workspace context
+    #       - Guard check: block spam/duplicates (zero LLM cost)
     #       - Execute: create/update/subtask with all fields + commit_author stored
     #       - Track classification for self-improvement
     #       - Always clear batch in finally block (prevents infinite retry)
     #    D. Periodic self-improvement (every 2 hours)
     #    E. Periodic LLM-driven cache cleanup (every hour)
+    #    F. Periodic workspace refresh (every 30 min, configurable)
+    #       - Re-fetches labels, workflow states, projects, cycles, members
+    #       - Picks up new items added in Linear since startup
     #    - Sleep with graceful shutdown support
 ```
 
@@ -304,6 +340,8 @@ Every sub-step in the main loop is independently wrapped so a single failure nev
 | `CACHE_CLEANUP_ERROR` | LLM cache review | Non-critical, retried next interval |
 | `SETUP_ERROR` | Individual startup step | Other setup steps still run |
 | `BACKFILL_STARTUP_ERROR` | Backfill on startup | Main loop starts regardless |
+| `GUARD_BLOCKED` | Spam/duplicate detected | Issue creation skipped, batch cleared |
+| `WORKSPACE_REFRESH_ERROR` | Workspace data refresh | Individual refresh step fails, others still run |
 | `MAIN_LOOP_ERROR` | Unexpected outer error | Caught, logged, loop continues |
 
 ---
@@ -354,9 +392,12 @@ All significant events are logged with distinctive uppercase tags for easy filte
 | Backfill started | `BACKFILL_START \| Checking N issue(s)` |
 | Backfill assignee resolved | `BACKFILL_ASSIGNEE \| LAT-xxx \| github=user → linear_user=...` |
 | Backfill completed | `BACKFILL_COMPLETE \| Updated N/M issue(s)` |
+| Guard blocked | `GUARD_BLOCKED \| check=... \| reason=... \| title=...` |
 | Improvement candidate | `IMPROVEMENT CANDIDATE GENERATED \| N suggestion(s)` |
 | Context promoted | `CONTEXT PROMOTED \| Version N \| Validated with 20+ consecutive correct` |
 | Cache cleanup | `LLM cache cleanup: removed N entries: [keys]` |
+| Workspace refresh | `WORKSPACE_REFRESH \| Refreshing projects, states, labels, cycles, members...` |
+| Workspace refresh done | `WORKSPACE_REFRESH_DONE \| N members, N states, N labels, N projects` |
 
 ---
 
@@ -435,12 +476,14 @@ docker compose up -d --build
 | **LLM-driven cache cleanup** | Gemini periodically reviews cache entries and purges stale data |
 | **Critical task override** | Hotfix/security/urgent commits bypass batch threshold |
 | **Per-user correlation** | Commits correlated with author's recent Linear tasks |
-| **Key × Model rotation** | 6 API keys × 4 models = 24 unique rate limit slots |
+| **Key × Model rotation** | N API keys × 4 models = N×4 unique rate limit slots (unlimited keys) |
 | **Resilient main loop** | Every sub-step independently error-handled; batch always cleared in `finally`; setup failures don't block startup |
 | **Docker Compose Watch** | `docker compose watch` auto-rebuilds on source file changes |
 | **Dry-run mode** | `DRY_RUN=true` logs actions without mutating Linear |
 | **Graceful shutdown** | SIGINT/SIGTERM saves state before exiting |
 | **Atomic state writes** | Write to temp file → rename to prevent corruption |
+| **Spam/duplicate guard** | GuardAgent blocks duplicate commits, similar titles, rate limit violations, and generic titles — zero LLM cost |
+| **Periodic workspace refresh** | Projects, states, labels, cycles, members re-fetched every 30 min to detect new items |
 | **Issue ownership guard** | Double-check (local registry + Linear label) before any update |
 
 ---
@@ -451,7 +494,7 @@ docker compose up -d --build
 linear_update/
 ├── main.py                    # Orchestrator loop (resilient error handling)
 ├── config.py                  # Configuration & validation
-├── models.py                  # Dataclasses (CommitInfo, GeminiResult, LinearIssueRecord)
+├── models.py                  # Dataclasses (CommitInfo, GeminiResult, LinearIssueRecord, GuardVerdict)
 ├── state.py                   # State persistence + CacheManager
 ├── Dockerfile
 ├── docker-compose.yml         # Includes develop.watch for auto-rebuild
@@ -463,7 +506,8 @@ linear_update/
 │   ├── gemini_agent.py        # AI classification + cache cleanup + learned rules
 │   ├── linear_agent.py        # Safe Linear mutations + backfill with assignee resolution
 │   ├── mapping_agent.py       # AI-powered user mapping
-│   └── improvement_agent.py   # Self-improving prompt context system
+│   ├── improvement_agent.py   # Self-improving prompt context system
+│   └── guard_agent.py         # Spam/duplicate detection gate (zero LLM cost)
 ├── state/                     # Auto-created at runtime
 │   ├── repo_shas.json
 │   ├── commit_buffer.json
@@ -474,6 +518,7 @@ linear_update/
 ├── .env                       # Secrets (gitignored)
 ├── .env.example
 ├── requirements.txt
+├── cheat_sheet.md             # Critical keyword quick reference
 ├── plan.md
 └── test_integration.py
 ```

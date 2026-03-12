@@ -14,7 +14,7 @@ import config
 from state import StateManager, CacheManager
 from agents import (
     GitHubAgent, BufferAgent, GeminiAgent, LinearAgent,
-    MappingAgent, ImprovementAgent,
+    MappingAgent, ImprovementAgent, GuardAgent,
 )
 
 logger = logging.getLogger("orchestrator")
@@ -60,6 +60,7 @@ def main():
     linear.set_mapping_agent(mapping)
     linear.set_github_agent(github)
     gemini.set_improvement_agent(improvement)
+    guard = GuardAgent(state)
 
     # 3. One-time setup — resolve team key to UUID
     linear.resolve_team()
@@ -95,6 +96,7 @@ def main():
         logger.error(f"BACKFILL_STARTUP_ERROR | {e}", exc_info=True)
 
     # 5. Main loop
+    _last_workspace_refresh = time.time()
     while not _shutdown:
         try:
             # --- Step A: Fetch new commits from GitHub ---
@@ -142,6 +144,19 @@ def main():
 
                     if result:
                         source_shas = [c.sha for c in batch]
+
+                        # Guard check — block spam/duplicates before Linear execution
+                        verdict = guard.evaluate(
+                            result, source_shas, list(created_issues.values()),
+                            user_recent_issues, primary_author
+                        )
+                        if not verdict:
+                            logger.info(
+                                f"GUARD_BLOCKED | action={result.action} | "
+                                f"check={verdict.check_name} | reason={verdict.reason}"
+                            )
+                            continue
+
                         try:
                             linear.execute(result, source_shas, primary_author)
                         except Exception as e:
@@ -198,6 +213,36 @@ def main():
                     cache.mark_llm_cleanup_done()
             except Exception as e:
                 logger.warning(f"CACHE_CLEANUP_ERROR | {e}")
+
+            # --- Step F: Periodic workspace data refresh ---
+            try:
+                elapsed = time.time() - _last_workspace_refresh
+                if elapsed >= config.WORKSPACE_REFRESH_SECONDS:
+                    logger.info("WORKSPACE_REFRESH | Refreshing projects, states, labels, cycles, members...")
+                    # Invalidate cached workspace data so fetch functions re-query the API
+                    for cache_key in ["team_members", "team_members_detail"]:
+                        cache.invalidate(cache_key)
+                    for name, fn in [
+                        ("fetch_team_labels", linear.fetch_team_labels),
+                        ("fetch_workflow_states", linear.fetch_workflow_states),
+                        ("fetch_projects", linear.fetch_projects),
+                        ("fetch_cycles", linear.fetch_cycles),
+                        ("fetch_team_members", linear.fetch_team_members),
+                    ]:
+                        try:
+                            fn()
+                        except Exception as e:
+                            logger.warning(f"WORKSPACE_REFRESH_ERROR | {name}: {e}")
+                    ws = linear.get_workspace_context()
+                    logger.info(
+                        f"WORKSPACE_REFRESH_DONE | {len(ws.get('members', []))} members, "
+                        f"{len(ws.get('workflow_states', []))} states, "
+                        f"{len(ws.get('labels', []))} labels, "
+                        f"{len(ws.get('projects', []))} projects"
+                    )
+                    _last_workspace_refresh = time.time()
+            except Exception as e:
+                logger.warning(f"WORKSPACE_REFRESH_ERROR | {e}")
 
         except KeyboardInterrupt:
             break
