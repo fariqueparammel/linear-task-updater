@@ -88,6 +88,10 @@ class BufferAgent:
         batch = buffer[: config.BATCH_SIZE]
         return batch
 
+    def pending_count(self) -> int:
+        """Return number of commits currently buffered."""
+        return len(self._state.load_buffer())
+
     def clear_batch(self, batch: list[CommitInfo]):
         """Remove processed commits from the buffer."""
         buffer = self._state.load_buffer()

@@ -66,10 +66,11 @@ class GitHubAgent:
             logger.error(f"Failed to fetch org repos: {e}")
             return []
 
-    def fetch_new_commits(self, repo, last_sha: str | None) -> tuple[list[CommitInfo], str | None]:
+    def fetch_new_commits(self, repo, last_sha: str | None) -> tuple[list[CommitInfo], str | None, int]:
         """
         Fetch new commits from a repo's default branch since last_sha.
-        Returns (list_of_commits_oldest_first, latest_sha).
+        Returns (list_of_commits_oldest_first, latest_sha, total_found_count).
+        total_found_count includes skipped commits (for diagnostics).
         """
         try:
             branch = repo.default_branch
@@ -77,6 +78,8 @@ class GitHubAgent:
 
             new_commits = []
             latest_sha = None
+            total_found = 0
+            skipped_count = 0
 
             for commit in commits_page:
                 sha = commit.sha
@@ -91,20 +94,41 @@ class GitHubAgent:
 
                 # If no last_sha (first run), just record position — don't backfill
                 if last_sha is None:
+                    logger.info(
+                        f"FIRST_RUN | {repo.full_name} | Recording position at {sha[:8]} "
+                        f"(branch: {branch}) — no backfill"
+                    )
                     latest_sha = sha
                     break
 
-                if self._should_skip(commit):
+                total_found += 1
+                msg_first_line = commit.commit.message.strip().splitlines()[0][:80]
+                author = commit.author.login if commit.author else (commit.commit.author.name if commit.commit.author else "unknown")
+
+                skip_reason = self._get_skip_reason(commit)
+                if skip_reason:
+                    skipped_count += 1
+                    logger.info(
+                        f"COMMIT_SKIPPED | repo={repo.full_name} | sha={sha[:8]} | "
+                        f"author={author} | reason={skip_reason} | \"{msg_first_line}\""
+                    )
                     continue
 
+                logger.info(
+                    f"COMMIT_FOUND | repo={repo.full_name} | sha={sha[:8]} | "
+                    f"author={author} | \"{msg_first_line}\""
+                )
                 new_commits.append(self._to_commit_info(commit, repo, branch))
 
             # Return oldest-first order
             new_commits.reverse()
 
-            if new_commits:
-                logger.info(f"{repo.full_name}: {len(new_commits)} new commit(s)")
-            return new_commits, latest_sha or last_sha
+            if total_found > 0:
+                logger.info(
+                    f"{repo.full_name}: {total_found} new commit(s) found — "
+                    f"{len(new_commits)} accepted, {skipped_count} skipped"
+                )
+            return new_commits, latest_sha or last_sha, total_found
 
         except GithubException as e:
             status = getattr(e, 'status', None)
@@ -113,10 +137,10 @@ class GitHubAgent:
                 logger.debug(f"Skipping {repo.full_name}: {status} {e.data.get('message', '')}")
             else:
                 logger.error(f"Failed to fetch commits for {repo.full_name}: {e}")
-            return [], last_sha
+            return [], last_sha, 0
         except Exception as e:
             logger.error(f"Unexpected error fetching {repo.full_name}: {e}")
-            return [], last_sha
+            return [], last_sha, 0
 
     def fetch_all_org_commits(
         self, repo_shas: dict[str, str]
@@ -128,18 +152,33 @@ class GitHubAgent:
         repos = self.fetch_org_repos()
         all_commits = []
         updated_shas = {}
+        total_found_all = 0
+        total_skipped_all = 0
+        repos_with_commits = 0
+        first_run_repos = 0
 
         for repo in repos:
             last_sha = repo_shas.get(repo.full_name)
-            new_commits, latest_sha = self.fetch_new_commits(repo, last_sha)
+            if last_sha is None:
+                first_run_repos += 1
+            new_commits, latest_sha, found_count = self.fetch_new_commits(repo, last_sha)
+
+            total_found_all += found_count
+            total_skipped_all += found_count - len(new_commits)
+            if found_count > 0:
+                repos_with_commits += 1
 
             if latest_sha:
                 updated_shas[repo.full_name] = latest_sha
 
             all_commits.extend(new_commits)
 
-        if all_commits:
-            logger.info(f"Total new commits across org: {len(all_commits)}")
+        # Always log scan summary
+        logger.info(
+            f"SCAN_COMPLETE | repos={len(repos)} | repos_with_new_commits={repos_with_commits} | "
+            f"total_found={total_found_all} | accepted={len(all_commits)} | "
+            f"skipped={total_skipped_all} | first_run_repos={first_run_repos}"
+        )
 
         return all_commits, updated_shas
 
@@ -180,26 +219,29 @@ class GitHubAgent:
             timestamp=commit.commit.author.date.isoformat(),
         )
 
-    def _should_skip(self, commit) -> bool:
-        """Filter out trivial commits that shouldn't become Linear tasks."""
+    def _get_skip_reason(self, commit) -> str | None:
+        """Return skip reason if commit should be filtered, or None if it should be kept."""
         msg = commit.commit.message.strip()
 
-        # Empty message
         if not msg:
-            return True
+            return "empty_message"
 
-        # Match any skip pattern (merges, version bumps, trivial, auto-generated)
-        if any(pattern.search(msg) for pattern in SKIP_PATTERNS):
-            return True
+        for pattern in SKIP_PATTERNS:
+            if pattern.search(msg):
+                return f"pattern:{pattern.pattern[:30]}"
 
-        # Bot authors
         author = ""
         if commit.author:
             author = commit.author.login.lower()
         elif commit.commit.author:
             author = commit.commit.author.name.lower()
 
-        if any(bot in author for bot in BOT_MARKERS):
-            return True
+        for bot in BOT_MARKERS:
+            if bot in author:
+                return f"bot_author:{bot}"
 
-        return False
+        return None
+
+    def _should_skip(self, commit) -> bool:
+        """Filter out trivial commits that shouldn't become Linear tasks."""
+        return self._get_skip_reason(commit) is not None

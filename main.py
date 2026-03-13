@@ -112,12 +112,8 @@ def main():
             # --- Step B: Buffer new commits ---
             try:
                 if new_commits:
-                    for c in new_commits:
-                        logger.info(
-                            f"COMMIT_FOUND | repo={c.repo} | author={c.author} | "
-                            f"sha={c.sha[:8]} | \"{c.message.splitlines()[0][:80]}\""
-                        )
                     buffer.add_commits(new_commits)
+                    logger.info(f"BUFFER_STATUS | added={len(new_commits)} | pending={buffer.pending_count()}")
             except Exception as e:
                 logger.error(f"BUFFER_ERROR | {e}", exc_info=True)
 
