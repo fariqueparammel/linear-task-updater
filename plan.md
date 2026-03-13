@@ -36,9 +36,8 @@ main.py (Orchestrator)
 GitHubAgent.fetch_all_org_commits()
     → BufferAgent.add_commits(commits)           [COMMIT_FOUND logged]
     → BufferAgent.is_ready()                     [critical override if hotfix/urgent]
-    → Filter created_issues by commit author     [per-user isolation]
-    → LinearAgent.fetch_user_recent_issues()     [author's Linear tasks only]
-    → GeminiAgent.classify(batch, author_issues) [sees ONLY author's tasks]
+    → LinearAgent.fetch_user_recent_issues()     [author's Linear tasks]
+    → GeminiAgent.classify(batch, ALL issues)    [all team tasks, labeled by owner]
     → GuardAgent.evaluate(result, shas, ALL)     [SHA dedup checks ALL users]
     → LinearAgent.execute(result, shas, author)  [ownership validation + CREATE/UPDATE]
     → ImprovementAgent.record_classification()   [accuracy tracking]
@@ -160,7 +159,7 @@ class GuardVerdict:
 **SlotManager**: `itertools.product(keys, models)` × `itertools.cycle` for maximum rate limit distribution.
 
 **Classification** (`classify()`):
-- Receives: commit batch, **author's** created issues (filtered by `commit_author`), user's recent tasks, full workspace context.
+- Receives: commit batch, **all team** created issues (labeled by `commit_author`), user's recent tasks, full workspace context, primary author.
 - Workspace context includes: team members, workflow states, labels, projects, cycles.
 - System prompt enforces field rules:
   - **Priority**: Integer 0-4 based on commit impact
@@ -316,10 +315,9 @@ def main():
     #    A. Fetch new commits → log COMMIT_FOUND events
     #    B. Buffer commits (critical override for hotfix/urgent)
     #    C. Process batches:
-    #       - Filter created_issues by commit author (per-user isolation)
     #       - Fetch author's recent Linear tasks
-    #       - Classify with author's tasks only + full workspace context
-    #       - Guard check: block spam/duplicates using ALL issues (zero LLM cost)
+    #       - Classify with ALL team tasks (labeled by owner) + full workspace context
+    #       - Guard check: block spam/duplicates (zero LLM cost)
     #       - Execute: ownership validation + create/update/subtask + commit_author stored
     #       - Track classification for self-improvement
     #       - Always clear batch in finally block (prevents infinite retry)
@@ -356,16 +354,17 @@ Every sub-step in the main loop is independently wrapped so a single failure nev
 
 ## 6. Per-User Task Correlation
 
-### Per-User Isolation
-Gemini only ever sees the commit author's own tasks. This prevents cross-user task correlation:
-- **Script-created issues**: Filtered by `commit_author == primary_author` before passing to Gemini
-- **Recent Linear tasks**: `fetch_user_recent_issues()` already queries by author's Linear user ID
-- **Guard checks**: Still use ALL issues for SHA dedup (a commit shouldn't be processed twice regardless of author)
-- **Ownership validation**: `LinearAgent.execute()` validates target issue ownership before UPDATE/SUBTASK — mismatches fall back to CREATE_NEW
+### Per-User Ownership Enforcement
+Gemini sees ALL team members' tasks (labeled by owner) for full context and duplicate awareness. Ownership is enforced at execution time:
+- **Script-created issues**: ALL issues passed to Gemini, each labeled with `[owner: username]` and `← YOURS` for the commit author's own tasks
+- **Recent Linear tasks**: `fetch_user_recent_issues()` queries by author's Linear user ID
+- **Gemini prompt rules**: Instructs Gemini to only UPDATE_EXISTING/ADD_SUBTASK for the commit author's own tasks (marked `← YOURS`)
+- **Guard checks**: Use ALL issues for SHA dedup (a commit shouldn't be processed twice regardless of author)
+- **Ownership validation**: `LinearAgent.execute()` validates target issue ownership before UPDATE/SUBTASK — mismatches fall back to CREATE_NEW (safety net)
 
 ### Flow
 ```
-New commit arrives
+New commit arrives (from any team member)
     → Extract author (GitHub username)
     → _resolve_github_to_linear_user(author)
         → Direct match? → Use it
@@ -373,11 +372,11 @@ New commit arrives
         → Fail? → MappingAgent.resolve(author, members, project_context)
             → Gemini infers via elimination / project context
             → Cache permanently for future lookups
-    → Filter created_issues by commit_author (per-user isolation)
     → LinearAgent.fetch_user_recent_issues(author)
-    → GeminiAgent.classify(batch, author_issues, user_recent_issues, workspace_context)
-        → Gemini sees ONLY the author's tasks
+    → GeminiAgent.classify(batch, ALL_created_issues, user_recent_issues, workspace_context)
+        → Gemini sees all team tasks (labeled by owner)
         → If related to author's existing task → ADD_SUBTASK or UPDATE_EXISTING
+        → If another user has similar task → CREATE_NEW for this author
         → If unrelated → CREATE_NEW
     → LinearAgent.execute()
         → Ownership check: target issue must belong to same author
@@ -496,7 +495,7 @@ docker compose up -d --build
 | **File-based caching** | JSON cache in `state/cache.json` survives restarts, with TTL and auto-purge |
 | **LLM-driven cache cleanup** | Gemini periodically reviews cache entries and purges stale data |
 | **Critical task override** | Hotfix/security/urgent commits bypass batch threshold |
-| **Per-user correlation** | Gemini only sees author's own tasks (script-created + recent). Ownership validation prevents cross-user updates |
+| **Per-user correlation** | Gemini sees all team tasks (labeled by owner) for full context. Ownership validation in execute() prevents cross-user updates |
 | **Key × Model rotation** | N API keys × 4 models = N×4 unique rate limit slots (unlimited keys) |
 | **Resilient main loop** | Every sub-step independently error-handled; batch always cleared in `finally`; setup failures don't block startup |
 | **Docker Compose Watch** | `docker compose watch` auto-rebuilds on source file changes |

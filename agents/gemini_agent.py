@@ -76,16 +76,17 @@ the list of script-created issues OR the commit author's recent tasks listed bel
 crash fix, or addresses a breaking/urgent production issue. Otherwise false.
 
 === PER-USER CORRELATION ===
-- You will receive ONLY the commit author's own tasks (both script-created and \
-their recent Linear tasks). You will NOT see other users' tasks.
-- For ADD_SUBTASK or UPDATE_EXISTING, you may ONLY reference task identifiers \
-from the lists provided below — these are exclusively the commit author's tasks.
+- You will see ALL team members' tasks (script-created and recent), each labeled \
+with their owner. The commit author is clearly identified.
+- For ADD_SUBTASK or UPDATE_EXISTING, you may ONLY target issues that belong to \
+the commit author (marked "← YOURS" in the issue list). NEVER target another \
+user's task — the system will reject it.
 - If the commit is clearly related to one of the author's existing tasks \
 (same feature area, same component, continuation of work), prefer ADD_SUBTASK \
 with that task as parent, or UPDATE_EXISTING if the task was script-created.
+- If another team member already has a similar task but it does NOT belong to \
+the commit author, still use CREATE_NEW — each user manages their own tasks.
 - If the commit is unrelated to any of the author's tasks, use CREATE_NEW.
-- NEVER reference a task identifier that is not in the provided lists — it may \
-belong to another user.
 """
 
 MAX_RETRIES = 8
@@ -147,13 +148,15 @@ class GeminiAgent:
         created_issues: list[LinearIssueRecord],
         user_recent_issues: list[dict] | None = None,
         workspace_context: dict | None = None,
+        primary_author: str | None = None,
     ) -> GeminiResult | None:
         """
         Send a commit batch to Gemini and get a classification result.
         Returns None if all retries fail.
         """
         user_prompt = self._build_user_prompt(
-            commits, created_issues, user_recent_issues, workspace_context
+            commits, created_issues, user_recent_issues, workspace_context,
+            primary_author
         )
         logger.info(f"Classifying batch of {len(commits)} commit(s) with Gemini")
 
@@ -250,8 +253,10 @@ class GeminiAgent:
         created_issues: list[LinearIssueRecord],
         user_recent_issues: list[dict] | None = None,
         workspace_context: dict | None = None,
+        primary_author: str | None = None,
     ) -> str:
         """Format commits, known issues, workspace context, and user's recent tasks."""
+        author = primary_author or (commits[0].author if commits else "unknown")
         lines = ["Recent commits to classify:\n"]
         for i, c in enumerate(commits, 1):
             lines.append(
@@ -266,8 +271,6 @@ class GeminiAgent:
                 for m in members:
                     email_part = f" ({m['email']})" if m.get("email") else ""
                     lines.append(f"  - {m['displayName']}{email_part}")
-                # Remind about matching
-                author = commits[0].author if commits else "unknown"
                 lines.append(
                     f"\nThe commit author's GitHub username is \"{author}\". "
                     f"Match this to one of the team members above. "
@@ -296,29 +299,35 @@ class GeminiAgent:
                 lines.append(f"\n=== CYCLES{active_note} ===")
                 lines.append(f"  {', '.join(cycles)}")
 
-        # Script-created issues (filtered to this author only)
-        author = commits[0].author if commits else "unknown"
+        # Script-created issues — ALL team members, labeled by owner
         if created_issues:
-            lines.append(f"\nScript-created issues by {author} (author's own tasks only):")
-            for issue in created_issues[-20:]:
+            lines.append(f"\n=== SCRIPT-CREATED ISSUES (all team members) ===")
+            lines.append(f"Commit author: {author}")
+            for issue in created_issues[-30:]:
                 title_part = f" \"{issue.title}\"" if issue.title else ""
-                lines.append(f"  - {issue.identifier}:{title_part} {issue.url}")
+                owner_tag = f" [owner: {issue.commit_author}]" if issue.commit_author else " [owner: unknown]"
+                is_mine = " ← YOURS" if issue.commit_author == author else ""
+                lines.append(f"  - {issue.identifier}:{title_part}{owner_tag}{is_mine} {issue.url}")
+            lines.append(
+                f"\nFor UPDATE_EXISTING or ADD_SUBTASK, you may ONLY target issues "
+                f"owned by the commit author ({author}), marked with '← YOURS' above."
+            )
         else:
-            lines.append(f"\nNo script-created issues by {author} yet.")
+            lines.append("\nNo script-created issues yet.")
 
         # User's recent tasks for correlation
         if user_recent_issues:
-            lines.append(f"\n{author}'s recent Linear tasks (author's own tasks only):")
+            lines.append(f"\n=== {author.upper()}'s RECENT LINEAR TASKS ===")
             for issue in user_recent_issues:
                 lines.append(
                     f"  - {issue['identifier']}: \"{issue['title']}\" ({issue['state']})"
                 )
             lines.append(
-                "\nIf the commit is related to one of the author's tasks above, "
+                f"\nIf the commit is related to one of {author}'s tasks above, "
                 "prefer ADD_SUBTASK or UPDATE_EXISTING referencing that task."
             )
         else:
-            lines.append("\nNo recent tasks found for the commit author.")
+            lines.append(f"\nNo recent tasks found for {author}.")
 
         return "\n".join(lines)
 

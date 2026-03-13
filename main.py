@@ -128,24 +128,21 @@ def main():
                     batch = buffer.get_batch()
                     all_created_issues = state.get_created_issues()
 
-                    # Per-user correlation — only show the author's own tasks to Gemini
+                    # Per-user correlation
                     primary_author = batch[0].author if batch else None
                     user_recent_issues = None
                     if primary_author:
-                        author_created_issues = [
-                            i for i in all_created_issues
-                            if i.commit_author == primary_author
-                        ]
                         try:
                             user_recent_issues = linear.fetch_user_recent_issues(primary_author)
                         except Exception as e:
                             logger.warning(f"USER_ISSUES_ERROR | author={primary_author} | {e}")
-                    else:
-                        author_created_issues = all_created_issues
 
                     workspace_context = linear.get_workspace_context()
+                    # Gemini sees ALL team tasks (labeled by owner) for full context;
+                    # ownership enforcement happens in LinearAgent.execute()
                     result = gemini.classify(
-                        batch, author_created_issues, user_recent_issues, workspace_context
+                        batch, all_created_issues, user_recent_issues,
+                        workspace_context, primary_author
                     )
 
                     if result:

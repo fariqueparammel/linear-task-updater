@@ -5,14 +5,14 @@ Automated multi-agent service that monitors all repositories in a GitHub organiz
 ## How It Works
 
 ```
-GitHub Commits → Buffer → Per-User Filter → Gemini AI Classification → Guard (spam check) → Linear Issue Creation
-                           (author's tasks     (N keys × 4 models)        (zero LLM cost)      (assignee, state, project,
-                            only to Gemini)                                                       cycle, label, priority)
+GitHub Commits → Buffer → Gemini AI Classification → Guard (spam check) → Ownership Check → Linear Issue Creation
+                           (all team tasks,            (zero LLM cost)     (per-user)          (assignee, state, project,
+                            N keys × 4 models)                                                   cycle, label, priority)
 ```
 
 1. **Fetches** new commits from every repo in your GitHub org (read-only)
 2. **Buffers** them until 3 commits accumulate (or 1 hour timeout). Critical commits (hotfix/security) process immediately
-3. **Classifies** the batch with Gemini AI using full workspace context — only the commit author's own tasks are shown to Gemini (per-user isolation)
+3. **Classifies** the batch with Gemini AI using full workspace context — all team members' tasks are shown (labeled by owner) for duplicate awareness
 4. **Guards** against spam — blocks duplicate commits, similar titles, rate limit violations, and generic titles (zero LLM cost)
 5. **Creates/updates** Linear issues with all fields resolved: assignee, workflow state, project, cycle, labels, priority
 6. **Self-improves** — tracks classification accuracy and iteratively refines the AI prompt after 20 consecutive correct results
@@ -158,7 +158,7 @@ State and logs persist on the host in `./state/` and `./logs/`.
 | **Backfill with assignee resolution** | On startup, unassigned issues get their commit author looked up and mapped to a Linear member |
 | **Spam/duplicate guard** | GuardAgent blocks duplicate commits, similar titles, rate limit violations, and generic titles before Linear execution — zero LLM cost |
 | **Critical commit override** | Commits containing hotfix/security/urgent/CVE/crash keywords bypass batch threshold and process immediately (see [`cheat_sheet.md`](cheat_sheet.md)) |
-| **Per-user task correlation** | Gemini only sees the commit author's own tasks — other users' tasks are never shown. Ownership validation prevents cross-user updates with automatic CREATE_NEW fallback |
+| **Per-user task correlation** | Gemini sees all team members' tasks (labeled by owner) for full context. Ownership validation in LinearAgent prevents cross-user updates with automatic CREATE_NEW fallback |
 | **Key × Model rotation** | N API keys × 4 models = N×4 unique rate limit slots before any repeat (unlimited keys supported) |
 | **Resilient error handling** | Every sub-step independently wrapped — a GitHub API failure doesn't block Linear updates, a Gemini timeout doesn't crash the loop |
 | **Periodic workspace refresh** | Projects, workflow states, labels, cycles, and members are re-fetched every 30 min to pick up new items (`WORKSPACE_REFRESH_SECONDS`) |
