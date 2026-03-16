@@ -19,6 +19,10 @@ CRITICAL_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# Thresholds for "large change" bypass — commits with major changes shouldn't wait
+LARGE_CHANGE_FILES_THRESHOLD = 10     # 10+ files changed
+LARGE_CHANGE_LINES_THRESHOLD = 500    # 500+ lines changed
+
 
 class BufferAgent:
     """Manages commit buffering and batch-ready detection."""
@@ -38,7 +42,25 @@ class BufferAgent:
         buffer = self._state.load_buffer()
         for commit in buffer:
             if CRITICAL_PATTERNS.search(commit.message):
-                logger.info(f"Critical commit detected: {commit.sha[:8]} — {commit.message[:60]}")
+                logger.info(f"Critical commit detected (keyword): {commit.sha[:8]} — {commit.message[:60]}")
+                return True
+        return False
+
+    def has_large_change(self) -> bool:
+        """Check if any buffered commit has massive file/line changes."""
+        buffer = self._state.load_buffer()
+        for commit in buffer:
+            if commit.files_changed >= LARGE_CHANGE_FILES_THRESHOLD:
+                logger.info(
+                    f"Large change detected (files={commit.files_changed}): "
+                    f"{commit.sha[:8]} — {commit.message[:60]}"
+                )
+                return True
+            if commit.lines_changed >= LARGE_CHANGE_LINES_THRESHOLD:
+                logger.info(
+                    f"Large change detected (lines={commit.lines_changed}): "
+                    f"{commit.sha[:8]} — {commit.message[:60]}"
+                )
                 return True
         return False
 
@@ -64,6 +86,14 @@ class BufferAgent:
             )
             return True
 
+        # Large changes (many files or lines) bypass batch threshold
+        if self.has_large_change():
+            logger.info(
+                f"Large change in buffer — bypassing batch threshold. "
+                f"Processing {len(buffer)} commit(s) immediately."
+            )
+            return True
+
         # Check timeout on oldest commit
         oldest_ts = buffer[0].timestamp
         try:
@@ -83,9 +113,26 @@ class BufferAgent:
         return False
 
     def get_batch(self) -> list[CommitInfo]:
-        """Pop up to BATCH_SIZE commits from the front of the buffer."""
+        """
+        Pop up to BATCH_SIZE commits from a single author.
+        Per-author batching ensures each Gemini call handles one user's work,
+        so commits from different users across different repos are never mixed.
+        """
         buffer = self._state.load_buffer()
-        batch = buffer[: config.BATCH_SIZE]
+        if not buffer:
+            return []
+
+        # Take the first commit's author and batch only their commits
+        target_author = buffer[0].author
+        author_commits = [c for c in buffer if c.author == target_author]
+        batch = author_commits[: config.BATCH_SIZE]
+
+        if len(set(c.author for c in buffer[:config.BATCH_SIZE])) > 1:
+            logger.info(
+                f"PER_AUTHOR_BATCH | Batching {len(batch)} commit(s) for author={target_author} "
+                f"(other authors queued separately)"
+            )
+
         return batch
 
     def pending_count(self) -> int:

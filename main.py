@@ -97,6 +97,8 @@ def main():
 
     # 5. Main loop
     _last_workspace_refresh = time.time()
+    _last_audit = time.time()
+    _last_model_refresh = time.time()
     while not _shutdown:
         try:
             # --- Step A: Fetch new commits from GitHub ---
@@ -243,6 +245,38 @@ def main():
                     _last_workspace_refresh = time.time()
             except Exception as e:
                 logger.warning(f"WORKSPACE_REFRESH_ERROR | {e}")
+
+            # --- Step G: Periodic Gemini model discovery ---
+            try:
+                model_elapsed = time.time() - _last_model_refresh
+                if model_elapsed >= config.MODEL_REFRESH_SECONDS:
+                    gemini.discover_and_refresh_models()
+                    _last_model_refresh = time.time()
+            except Exception as e:
+                logger.warning(f"MODEL_REFRESH_ERROR | {e}")
+
+            # --- Step H: Periodic missed-commit audit ---
+            try:
+                audit_elapsed = time.time() - _last_audit
+                if audit_elapsed >= config.AUDIT_INTERVAL_SECONDS:
+                    logger.info("AUDIT_START | Checking for missed commits across all repos...")
+                    # Collect all SHAs we know about (processed + buffered)
+                    known_shas = set()
+                    for issue in state.get_created_issues():
+                        known_shas.update(issue.source_commits)
+                    for c in state.load_buffer():
+                        known_shas.add(c.sha)
+
+                    repo_shas = state.get_repo_shas()
+                    missed = github.audit_missed_commits(repo_shas, known_shas)
+                    if missed:
+                        logger.warning(
+                            f"AUDIT_RECOVERY | Re-injecting {len(missed)} missed commit(s) into buffer"
+                        )
+                        buffer.add_commits(missed)
+                    _last_audit = time.time()
+            except Exception as e:
+                logger.warning(f"AUDIT_ERROR | {e}")
 
         except KeyboardInterrupt:
             break

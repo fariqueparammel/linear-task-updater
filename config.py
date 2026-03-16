@@ -42,6 +42,8 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "3"))
 BATCH_TIMEOUT_SECONDS = int(os.getenv("BATCH_TIMEOUT_SECONDS", "3600"))
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 WORKSPACE_REFRESH_SECONDS = int(os.getenv("WORKSPACE_REFRESH_SECONDS", "1800"))  # 30 min
+AUDIT_INTERVAL_SECONDS = int(os.getenv("AUDIT_INTERVAL_SECONDS", "600"))  # 10 min — missed commit audit
+MODEL_REFRESH_SECONDS = int(os.getenv("MODEL_REFRESH_SECONDS", "3600"))  # 1 hour — Gemini model discovery
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # --- Paths ---

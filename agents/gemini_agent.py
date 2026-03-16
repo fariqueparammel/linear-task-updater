@@ -87,6 +87,14 @@ with that task as parent, or UPDATE_EXISTING if the task was script-created.
 - If another team member already has a similar task but it does NOT belong to \
 the commit author, still use CREATE_NEW — each user manages their own tasks.
 - If the commit is unrelated to any of the author's tasks, use CREATE_NEW.
+
+=== LARGE CHANGES ===
+- Commits may include file/line change stats (e.g. "10 files changed, 800 lines").
+- For commits with many files changed (10+) or many lines (500+), these represent \
+significant work. If the author already has a related parent task, use ADD_SUBTASK \
+to break it down. If no related task exists, use CREATE_NEW.
+- Large commits deserve higher priority (2 or above) and a detailed description \
+summarizing what the changes cover.
 """
 
 MAX_RETRIES = 8
@@ -131,9 +139,11 @@ class GeminiAgent:
     """Classifies commit batches using Gemini AI with key+model rotation."""
 
     def __init__(self, keys: list[str]):
+        self._keys = keys
         self._slot_manager = SlotManager(keys, config.GEMINI_MODELS)
         self._improvement_agent = None  # Set via set_improvement_agent()
         self._context_additions = ""    # Active learned rules appended to prompt
+        self._active_models = list(config.GEMINI_MODELS)  # Track discovered models
 
     def set_improvement_agent(self, improvement_agent):
         """Inject the ImprovementAgent for self-improving prompts."""
@@ -259,8 +269,11 @@ class GeminiAgent:
         author = primary_author or (commits[0].author if commits else "unknown")
         lines = ["Recent commits to classify:\n"]
         for i, c in enumerate(commits, 1):
+            stats_part = ""
+            if c.files_changed or c.lines_changed:
+                stats_part = f", {c.files_changed} files changed, {c.lines_changed} lines"
             lines.append(
-                f"Commit {i} (by {c.author}, repo: {c.repo}, {c.timestamp}):\n{c.message}\n"
+                f"Commit {i} (by {c.author}, repo: {c.repo}, {c.timestamp}{stats_part}):\n{c.message}\n"
             )
 
         # Workspace metadata — valid values for Gemini to pick from
@@ -401,6 +414,113 @@ class GeminiAgent:
 
         except Exception as e:
             logger.warning(f"LLM cache cleanup failed (non-critical): {e}")
+            return []
+
+    def discover_and_refresh_models(self) -> list[str]:
+        """
+        Query the Gemini models.list API to discover available text-to-text models.
+        Filters for generateContent-capable models and rebuilds the slot rotation.
+        Returns list of discovered model names, or empty list on failure.
+        """
+        key = self._keys[0] if self._keys else None
+        if not key:
+            logger.warning("MODEL_DISCOVERY | No API keys available")
+            return []
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}&pageSize=100"
+
+        try:
+            resp = requests.get(url, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+
+            models = data.get("models", [])
+            text_models = []
+            skipped_models = []
+
+            for m in models:
+                name = m.get("name", "")  # e.g. "models/gemini-2.5-flash"
+                short_name = name.replace("models/", "")
+                supported = m.get("supportedGenerationMethods", [])
+                input_limit = m.get("inputTokenLimit", 0)
+                output_limit = m.get("outputTokenLimit", 0)
+                description = m.get("description", "").lower()
+
+                # Must support generateContent (text generation)
+                if "generateContent" not in supported:
+                    skipped_models.append(f"{short_name} (no generateContent)")
+                    continue
+
+                # Must have both input and output token limits (text-in → text-out)
+                if not input_limit or not output_limit:
+                    skipped_models.append(f"{short_name} (no token limits)")
+                    continue
+
+                # Skip non-text models: embedding, vision-only, image gen, video gen, audio, AQA
+                NON_TEXT_MARKERS = (
+                    "embedding", "aqa", "imagen", "veo", "music",
+                    "tts", "speech", "whisper", "moderation",
+                )
+                if any(skip in short_name for skip in NON_TEXT_MARKERS):
+                    skipped_models.append(f"{short_name} (non-text model)")
+                    continue
+
+                # Skip if description indicates non-text-generation purpose
+                NON_TEXT_DESCRIPTIONS = ("embed", "image generation", "video generation", "text-to-speech")
+                if any(nd in description for nd in NON_TEXT_DESCRIPTIONS):
+                    skipped_models.append(f"{short_name} (non-text description)")
+                    continue
+
+                # Must have a reasonable output limit for JSON classification responses
+                if output_limit < 256:
+                    skipped_models.append(f"{short_name} (output limit too small: {output_limit})")
+                    continue
+
+                text_models.append(short_name)
+
+            logger.info(
+                f"MODEL_DISCOVERY | API returned {len(models)} models total — "
+                f"{len(text_models)} text-to-text, {len(skipped_models)} skipped"
+            )
+            if skipped_models:
+                logger.debug(f"MODEL_DISCOVERY | Skipped: {', '.join(skipped_models)}")
+
+            if not text_models:
+                logger.warning("MODEL_DISCOVERY | No text-to-text models found from API")
+                return []
+
+            # Compare with current list
+            current_set = set(self._active_models)
+            discovered_set = set(text_models)
+            new_models = discovered_set - current_set
+            removed_models = current_set - discovered_set
+
+            if new_models:
+                logger.info(f"MODEL_DISCOVERY | New models available: {sorted(new_models)}")
+            if removed_models:
+                logger.info(f"MODEL_DISCOVERY | Models no longer available: {sorted(removed_models)}")
+
+            if new_models or removed_models:
+                self._active_models = text_models
+                # Rebuild slot manager with updated model list
+                self._slot_manager = SlotManager(self._keys, text_models)
+                logger.info(
+                    f"MODEL_REFRESH | Rebuilt slot rotation with {len(text_models)} models: "
+                    f"{', '.join(text_models)}"
+                )
+            else:
+                logger.info(
+                    f"MODEL_DISCOVERY | No changes. {len(text_models)} models still available."
+                )
+
+            return text_models
+
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else "?"
+            logger.warning(f"MODEL_DISCOVERY | API error (HTTP {status}): {e}")
+            return []
+        except Exception as e:
+            logger.warning(f"MODEL_DISCOVERY | Failed: {e}")
             return []
 
     @staticmethod

@@ -26,10 +26,18 @@ SKIP_PATTERNS = [
     re.compile(r"^.{0,3}$"),
 ]
 
-BOT_MARKERS = ("[bot]", "dependabot", "renovate", "github-actions", "snyk-bot", "codecov")
+# Bot author detection — only exact username matches or the [bot] suffix.
+# Using exact matches prevents false positives on real users whose names
+# might contain substrings like "bot" or "renovate".
+BOT_EXACT_USERNAMES = {"dependabot", "renovate-bot", "github-actions", "snyk-bot", "codecov-commenter", "codecov-io"}
+BOT_SUFFIX = "[bot]"
 
 # Repos with these name patterns are likely not code repos
 SKIP_REPO_PATTERNS = re.compile(r"(\.github|template|archived|deprecated)", re.IGNORECASE)
+
+# Safety cap: max commits to process per repo per poll cycle.
+# Prevents runaway iteration when last_sha is missing from history (force push / rebase).
+MAX_NEW_COMMITS_PER_REPO = 100
 
 
 class GitHubAgent:
@@ -48,18 +56,21 @@ class GitHubAgent:
         try:
             org = self._gh.get_organization(self._org_name)
             repos = []
+            skipped_repos = []
             for repo in org.get_repos(type="all"):
                 if repo.archived or repo.fork:
                     continue
                 # Skip repos with known non-code patterns
                 if SKIP_REPO_PATTERNS.search(repo.name):
-                    logger.debug(f"Skipping repo (name pattern): {repo.full_name}")
+                    skipped_repos.append(f"{repo.full_name} (name pattern)")
                     continue
                 # Skip empty repos (size == 0 means no content pushed)
                 if repo.size == 0:
-                    logger.debug(f"Skipping empty repo: {repo.full_name}")
+                    skipped_repos.append(f"{repo.full_name} (empty)")
                     continue
                 repos.append(repo)
+            if skipped_repos:
+                logger.info(f"REPOS_SKIPPED | {len(skipped_repos)} repo(s): {', '.join(skipped_repos)}")
             logger.info(f"Found {len(repos)} active repos in {self._org_name}")
             return repos
         except GithubException as e:
@@ -102,6 +113,15 @@ class GitHubAgent:
                     break
 
                 total_found += 1
+
+                # Safety cap: stop if too many commits (e.g. last_sha lost after force push)
+                if total_found > MAX_NEW_COMMITS_PER_REPO:
+                    logger.warning(
+                        f"COMMIT_CAP_HIT | {repo.full_name} | Stopped at {MAX_NEW_COMMITS_PER_REPO} commits. "
+                        f"Possible force-push or stale SHA. Some older commits may be missed."
+                    )
+                    break
+
                 msg_first_line = commit.commit.message.strip().splitlines()[0][:80]
                 author = commit.author.login if commit.author else (commit.commit.author.name if commit.commit.author else "unknown")
 
@@ -114,11 +134,13 @@ class GitHubAgent:
                     )
                     continue
 
+                info = self._to_commit_info(commit, repo, branch)
                 logger.info(
                     f"COMMIT_FOUND | repo={repo.full_name} | sha={sha[:8]} | "
-                    f"author={author} | \"{msg_first_line}\""
+                    f"author={author} | files={info.files_changed} | "
+                    f"lines={info.lines_changed} | \"{msg_first_line}\""
                 )
-                new_commits.append(self._to_commit_info(commit, repo, branch))
+                new_commits.append(info)
 
             # Return oldest-first order
             new_commits.reverse()
@@ -203,12 +225,91 @@ class GitHubAgent:
             logger.debug(f"Commit lookup failed for {sha[:8]}: {e}")
             return None
 
+    def audit_missed_commits(
+        self, repo_shas: dict[str, str], known_shas: set[str], lookback: int = 20
+    ) -> list[CommitInfo]:
+        """
+        Integrity check: for each repo, fetch the last `lookback` commits on the
+        default branch and compare against known_shas (all SHAs we've ever processed
+        or buffered). Any commit between HEAD and our recorded last_sha that isn't
+        in known_shas AND wasn't skipped is a missed commit.
+
+        Returns list of missed CommitInfo objects that should be re-injected.
+        """
+        repos = self.fetch_org_repos()
+        missed = []
+
+        for repo in repos:
+            last_sha = repo_shas.get(repo.full_name)
+            if not last_sha:
+                continue  # First-run repos handled by normal flow
+
+            try:
+                branch = repo.default_branch
+                commits_page = repo.get_commits(sha=branch)
+                count = 0
+
+                for commit in commits_page:
+                    sha = commit.sha
+                    count += 1
+
+                    if count > lookback:
+                        break
+                    if sha == last_sha:
+                        break  # Reached our recorded position — all good
+
+                    # Already known (processed or in buffer)
+                    if sha in known_shas:
+                        continue
+
+                    # Check if it would be skipped by our filters
+                    if self._get_skip_reason(commit):
+                        continue
+
+                    # This is a real commit we missed
+                    info = self._to_commit_info(commit, repo, branch)
+                    logger.warning(
+                        f"MISSED_COMMIT | repo={repo.full_name} | sha={sha[:8]} | "
+                        f"author={info.author} | files={info.files_changed} | "
+                        f"\"{info.message.splitlines()[0][:80]}\""
+                    )
+                    missed.append(info)
+
+            except GithubException as e:
+                status = getattr(e, 'status', None)
+                if status not in (409, 404, 403):
+                    logger.error(f"AUDIT_ERROR | {repo.full_name}: {e}")
+            except Exception as e:
+                logger.error(f"AUDIT_ERROR | {repo.full_name}: {e}")
+
+        if missed:
+            logger.warning(f"AUDIT_RESULT | Found {len(missed)} missed commit(s) across org")
+        else:
+            logger.info("AUDIT_RESULT | No missed commits detected")
+
+        # Return oldest-first
+        missed.reverse()
+        return missed
+
     def _to_commit_info(self, commit, repo, branch: str) -> CommitInfo:
         author_name = "unknown"
         if commit.author:
             author_name = commit.author.login
         elif commit.commit.author:
             author_name = commit.commit.author.name
+
+        # Fetch file/line stats (triggers one extra API call per commit)
+        files_changed = 0
+        lines_changed = 0
+        try:
+            stats = commit.stats
+            if stats:
+                lines_changed = (stats.additions or 0) + (stats.deletions or 0)
+            files = commit.files
+            if files:
+                files_changed = len(files)
+        except Exception as e:
+            logger.debug(f"Could not fetch stats for {commit.sha[:8]}: {e}")
 
         return CommitInfo(
             sha=commit.sha,
@@ -217,6 +318,8 @@ class GitHubAgent:
             repo=repo.full_name,
             branch=branch,
             timestamp=commit.commit.author.date.isoformat(),
+            files_changed=files_changed,
+            lines_changed=lines_changed,
         )
 
     def _get_skip_reason(self, commit) -> str | None:
@@ -236,9 +339,10 @@ class GitHubAgent:
         elif commit.commit.author:
             author = commit.commit.author.name.lower()
 
-        for bot in BOT_MARKERS:
-            if bot in author:
-                return f"bot_author:{bot}"
+        if author.endswith(BOT_SUFFIX):
+            return f"bot_author:{author}"
+        if author in BOT_EXACT_USERNAMES:
+            return f"bot_author:{author}"
 
         return None
 

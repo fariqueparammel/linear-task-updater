@@ -9,13 +9,24 @@ class CommitInfo:
     repo: str          # "org/repo-name"
     branch: str
     timestamp: str     # ISO format
+    files_changed: int = 0   # Number of files modified in this commit
+    lines_changed: int = 0   # Total lines added + deleted
 
     def to_dict(self):
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "CommitInfo":
-        return cls(**d)
+        return cls(
+            sha=d["sha"],
+            message=d["message"],
+            author=d["author"],
+            repo=d["repo"],
+            branch=d["branch"],
+            timestamp=d["timestamp"],
+            files_changed=d.get("files_changed", 0),
+            lines_changed=d.get("lines_changed", 0),
+        )
 
 
 @dataclass
