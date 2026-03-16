@@ -59,9 +59,16 @@ class StateManager:
     def update_repo_shas(self, updated: dict[str, str]):
         """Merge updated SHAs into existing state."""
         current = self.get_repo_shas()
+        changed = {k: v for k, v in updated.items() if current.get(k) != v}
         current.update(updated)
         self._write_json(self._repo_shas_path, current)
-        logger.debug(f"Updated SHAs for {len(updated)} repos")
+        if changed:
+            logger.info(
+                f"STATE_WRITE | repo_shas.json updated — {len(changed)} SHA(s) changed: "
+                + ", ".join(f"{k.split('/')[-1]}={v[:8]}" for k, v in changed.items())
+            )
+        else:
+            logger.debug(f"STATE_WRITE | repo_shas.json — {len(updated)} repos, no SHA changes")
 
     # --- Commit buffer ---
 

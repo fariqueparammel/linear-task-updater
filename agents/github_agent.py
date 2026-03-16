@@ -9,6 +9,7 @@ import logging
 import re
 from github import Github, GithubException
 from models import CommitInfo
+import config
 
 logger = logging.getLogger("agent.github")
 
@@ -101,6 +102,12 @@ class GitHubAgent:
 
                 # Stop when we reach the last processed commit
                 if sha == last_sha:
+                    if total_found == 0:
+                        log_fn = logger.info if config.VERBOSE_REPO_SCAN else logger.debug
+                        log_fn(
+                            f"REPO_UNCHANGED | {repo.full_name} | branch={branch} | "
+                            f"head={sha[:8]} — no new commits"
+                        )
                     break
 
                 # If no last_sha (first run), just record position — don't backfill
@@ -178,6 +185,8 @@ class GitHubAgent:
         total_skipped_all = 0
         repos_with_commits = 0
         first_run_repos = 0
+        unchanged_repos = 0
+        sha_changed_repos = []
 
         for repo in repos:
             last_sha = repo_shas.get(repo.full_name)
@@ -193,14 +202,23 @@ class GitHubAgent:
             if latest_sha:
                 updated_shas[repo.full_name] = latest_sha
 
+            # Track SHA changes per repo for diagnostics
+            if last_sha and latest_sha and last_sha == latest_sha:
+                unchanged_repos += 1
+            elif last_sha and latest_sha and last_sha != latest_sha:
+                sha_changed_repos.append(repo.full_name)
+
             all_commits.extend(new_commits)
 
         # Always log scan summary
         logger.info(
             f"SCAN_COMPLETE | repos={len(repos)} | repos_with_new_commits={repos_with_commits} | "
             f"total_found={total_found_all} | accepted={len(all_commits)} | "
-            f"skipped={total_skipped_all} | first_run_repos={first_run_repos}"
+            f"skipped={total_skipped_all} | first_run_repos={first_run_repos} | "
+            f"unchanged={unchanged_repos}"
         )
+        if sha_changed_repos:
+            logger.info(f"SHA_CHANGED | repos: {', '.join(sha_changed_repos)}")
 
         return all_commits, updated_shas
 

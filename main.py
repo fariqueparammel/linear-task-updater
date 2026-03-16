@@ -45,6 +45,7 @@ def main():
     logger.info(f"  Batch size:    {config.BATCH_SIZE}")
     logger.info(f"  Batch timeout: {config.BATCH_TIMEOUT_SECONDS}s")
     logger.info(f"  Dry run:       {config.DRY_RUN}")
+    logger.info(f"  Verbose scan:  {config.VERBOSE_REPO_SCAN}")
     logger.info(f"  Gemini keys:   {len(config.GEMINI_KEYS)}")
     logger.info("=" * 60)
 

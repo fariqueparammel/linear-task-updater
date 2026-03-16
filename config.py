@@ -45,6 +45,7 @@ WORKSPACE_REFRESH_SECONDS = int(os.getenv("WORKSPACE_REFRESH_SECONDS", "1800")) 
 AUDIT_INTERVAL_SECONDS = int(os.getenv("AUDIT_INTERVAL_SECONDS", "600"))  # 10 min — missed commit audit
 MODEL_REFRESH_SECONDS = int(os.getenv("MODEL_REFRESH_SECONDS", "3600"))  # 1 hour — Gemini model discovery
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+VERBOSE_REPO_SCAN = os.getenv("VERBOSE_REPO_SCAN", "false").lower() == "true"  # Log each repo's SHA check
 
 # --- Paths ---
 STATE_DIR = os.path.join(os.path.dirname(__file__), "state")
