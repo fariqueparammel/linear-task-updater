@@ -78,14 +78,30 @@ class GitHubAgent:
             logger.error(f"Failed to fetch org repos: {e}")
             return []
 
-    def fetch_new_commits(self, repo, last_sha: str | None) -> tuple[list[CommitInfo], str | None, int]:
+    def fetch_repo_branches(self, repo) -> list[str]:
+        """List all branch names for a repo. Returns at least the default branch."""
+        try:
+            branches = [b.name for b in repo.get_branches()]
+            if not branches:
+                branches = [repo.default_branch]
+            logger.debug(f"BRANCHES | {repo.full_name}: {len(branches)} branch(es)")
+            return branches
+        except GithubException as e:
+            logger.debug(f"Could not list branches for {repo.full_name}: {e}")
+            return [repo.default_branch]
+
+    def fetch_new_commits(
+        self, repo, branch: str, last_sha: str | None, seen_shas: set[str] | None = None
+    ) -> tuple[list[CommitInfo], str | None, int]:
         """
-        Fetch new commits from a repo's default branch since last_sha.
+        Fetch new commits from a specific branch since last_sha.
+        seen_shas: set of SHAs already processed in this scan cycle (cross-branch dedup).
         Returns (list_of_commits_oldest_first, latest_sha, total_found_count).
         total_found_count includes skipped commits (for diagnostics).
         """
+        if seen_shas is None:
+            seen_shas = set()
         try:
-            branch = repo.default_branch
             commits_page = repo.get_commits(sha=branch)
 
             new_commits = []
@@ -119,12 +135,17 @@ class GitHubAgent:
                     latest_sha = sha
                     break
 
+                # Cross-branch dedup: skip if already processed from another branch
+                if sha in seen_shas:
+                    continue
+
                 total_found += 1
 
                 # Safety cap: stop if too many commits (e.g. last_sha lost after force push)
                 if total_found > MAX_NEW_COMMITS_PER_REPO:
                     logger.warning(
-                        f"COMMIT_CAP_HIT | {repo.full_name} | Stopped at {MAX_NEW_COMMITS_PER_REPO} commits. "
+                        f"COMMIT_CAP_HIT | {repo.full_name}:{branch} | "
+                        f"Stopped at {MAX_NEW_COMMITS_PER_REPO} commits. "
                         f"Possible force-push or stale SHA. Some older commits may be missed."
                     )
                     break
@@ -136,17 +157,19 @@ class GitHubAgent:
                 if skip_reason:
                     skipped_count += 1
                     logger.info(
-                        f"COMMIT_SKIPPED | repo={repo.full_name} | sha={sha[:8]} | "
+                        f"COMMIT_SKIPPED | repo={repo.full_name} | branch={branch} | sha={sha[:8]} | "
                         f"author={author} | reason={skip_reason} | \"{msg_first_line}\""
                     )
+                    seen_shas.add(sha)
                     continue
 
                 info = self._to_commit_info(commit, repo, branch)
                 logger.info(
-                    f"COMMIT_FOUND | repo={repo.full_name} | sha={sha[:8]} | "
+                    f"COMMIT_FOUND | repo={repo.full_name} | branch={branch} | sha={sha[:8]} | "
                     f"author={author} | files={info.files_changed} | "
                     f"lines={info.lines_changed} | \"{msg_first_line}\""
                 )
+                seen_shas.add(sha)
                 new_commits.append(info)
 
             # Return oldest-first order
@@ -175,7 +198,8 @@ class GitHubAgent:
         self, repo_shas: dict[str, str]
     ) -> tuple[list[CommitInfo], dict[str, str]]:
         """
-        Iterate all org repos and fetch new commits for each.
+        Iterate all org repos and ALL branches, fetch new commits for each.
+        repo_shas key format: "org/repo:branch" (e.g. "latelogic/app:main").
         Returns (aggregated_commits, updated_sha_map).
         """
         repos = self.fetch_org_repos()
@@ -183,42 +207,64 @@ class GitHubAgent:
         updated_shas = {}
         total_found_all = 0
         total_skipped_all = 0
-        repos_with_commits = 0
-        first_run_repos = 0
-        unchanged_repos = 0
-        sha_changed_repos = []
+        branches_with_commits = 0
+        first_run_branches = 0
+        unchanged_branches = 0
+        total_branches = 0
+        sha_changed = []
 
         for repo in repos:
-            last_sha = repo_shas.get(repo.full_name)
-            if last_sha is None:
-                first_run_repos += 1
-            new_commits, latest_sha, found_count = self.fetch_new_commits(repo, last_sha)
+            branches = self.fetch_repo_branches(repo)
+            # Cross-branch dedup: commits shared between branches are only processed once
+            seen_shas_for_repo = set()
 
-            total_found_all += found_count
-            total_skipped_all += found_count - len(new_commits)
-            if found_count > 0:
-                repos_with_commits += 1
+            for branch in branches:
+                total_branches += 1
+                sha_key = f"{repo.full_name}:{branch}"
+                last_sha = repo_shas.get(sha_key)
 
-            if latest_sha:
-                updated_shas[repo.full_name] = latest_sha
+                # Migration: check old format (repo-only key) for the default branch
+                if last_sha is None and branch == repo.default_branch:
+                    last_sha = repo_shas.get(repo.full_name)
+                    if last_sha:
+                        logger.info(
+                            f"SHA_MIGRATE | {repo.full_name} → {sha_key} "
+                            f"(migrating from repo-only key)"
+                        )
 
-            # Track SHA changes per repo for diagnostics
-            if last_sha and latest_sha and last_sha == latest_sha:
-                unchanged_repos += 1
-            elif last_sha and latest_sha and last_sha != latest_sha:
-                sha_changed_repos.append(repo.full_name)
+                if last_sha is None:
+                    first_run_branches += 1
 
-            all_commits.extend(new_commits)
+                new_commits, latest_sha, found_count = self.fetch_new_commits(
+                    repo, branch, last_sha, seen_shas_for_repo
+                )
+
+                total_found_all += found_count
+                total_skipped_all += found_count - len(new_commits)
+                if found_count > 0:
+                    branches_with_commits += 1
+
+                if latest_sha:
+                    updated_shas[sha_key] = latest_sha
+
+                # Track SHA changes for diagnostics
+                if last_sha and latest_sha and last_sha == latest_sha:
+                    unchanged_branches += 1
+                elif last_sha and latest_sha and last_sha != latest_sha:
+                    sha_changed.append(f"{repo.full_name}:{branch}")
+
+                all_commits.extend(new_commits)
 
         # Always log scan summary
         logger.info(
-            f"SCAN_COMPLETE | repos={len(repos)} | repos_with_new_commits={repos_with_commits} | "
+            f"SCAN_COMPLETE | repos={len(repos)} | branches={total_branches} | "
+            f"branches_with_new_commits={branches_with_commits} | "
             f"total_found={total_found_all} | accepted={len(all_commits)} | "
-            f"skipped={total_skipped_all} | first_run_repos={first_run_repos} | "
-            f"unchanged={unchanged_repos}"
+            f"skipped={total_skipped_all} | first_run={first_run_branches} | "
+            f"unchanged={unchanged_branches}"
         )
-        if sha_changed_repos:
-            logger.info(f"SHA_CHANGED | repos: {', '.join(sha_changed_repos)}")
+        if sha_changed:
+            logger.info(f"SHA_CHANGED | {', '.join(sha_changed)}")
 
         return all_commits, updated_shas
 
@@ -247,65 +293,70 @@ class GitHubAgent:
         self, repo_shas: dict[str, str], known_shas: set[str], lookback: int = 20
     ) -> list[CommitInfo]:
         """
-        Integrity check: for each repo, fetch the last `lookback` commits on the
-        default branch and compare against known_shas (all SHAs we've ever processed
-        or buffered). Any commit between HEAD and our recorded last_sha that isn't
-        in known_shas AND wasn't skipped is a missed commit.
+        Integrity check: for each repo+branch, fetch the last `lookback` commits
+        and compare against known_shas (all SHAs we've ever processed or buffered).
+        Any commit between HEAD and our recorded last_sha that isn't in known_shas
+        AND wasn't skipped is a missed commit.
 
         Returns list of missed CommitInfo objects that should be re-injected.
         """
         repos = self.fetch_org_repos()
         missed = []
+        audit_seen = set()  # Dedup across branches
 
         for repo in repos:
-            last_sha = repo_shas.get(repo.full_name)
-            if not last_sha:
-                continue  # First-run repos handled by normal flow
+            branches = self.fetch_repo_branches(repo)
 
-            try:
-                branch = repo.default_branch
-                commits_page = repo.get_commits(sha=branch)
-                count = 0
+            for branch in branches:
+                sha_key = f"{repo.full_name}:{branch}"
+                last_sha = repo_shas.get(sha_key)
+                # Migration fallback for default branch
+                if not last_sha and branch == repo.default_branch:
+                    last_sha = repo_shas.get(repo.full_name)
+                if not last_sha:
+                    continue  # First-run branches handled by normal flow
 
-                for commit in commits_page:
-                    sha = commit.sha
-                    count += 1
+                try:
+                    commits_page = repo.get_commits(sha=branch)
+                    count = 0
 
-                    if count > lookback:
-                        break
-                    if sha == last_sha:
-                        break  # Reached our recorded position — all good
+                    for commit in commits_page:
+                        sha = commit.sha
+                        count += 1
 
-                    # Already known (processed or in buffer)
-                    if sha in known_shas:
-                        continue
+                        if count > lookback:
+                            break
+                        if sha == last_sha:
+                            break
 
-                    # Check if it would be skipped by our filters
-                    if self._get_skip_reason(commit):
-                        continue
+                        if sha in known_shas or sha in audit_seen:
+                            continue
 
-                    # This is a real commit we missed
-                    info = self._to_commit_info(commit, repo, branch)
-                    logger.warning(
-                        f"MISSED_COMMIT | repo={repo.full_name} | sha={sha[:8]} | "
-                        f"author={info.author} | files={info.files_changed} | "
-                        f"\"{info.message.splitlines()[0][:80]}\""
-                    )
-                    missed.append(info)
+                        if self._get_skip_reason(commit):
+                            continue
 
-            except GithubException as e:
-                status = getattr(e, 'status', None)
-                if status not in (409, 404, 403):
-                    logger.error(f"AUDIT_ERROR | {repo.full_name}: {e}")
-            except Exception as e:
-                logger.error(f"AUDIT_ERROR | {repo.full_name}: {e}")
+                        info = self._to_commit_info(commit, repo, branch)
+                        logger.warning(
+                            f"MISSED_COMMIT | repo={repo.full_name} | branch={branch} | "
+                            f"sha={sha[:8]} | author={info.author} | "
+                            f"files={info.files_changed} | "
+                            f"\"{info.message.splitlines()[0][:80]}\""
+                        )
+                        audit_seen.add(sha)
+                        missed.append(info)
+
+                except GithubException as e:
+                    status = getattr(e, 'status', None)
+                    if status not in (409, 404, 403):
+                        logger.error(f"AUDIT_ERROR | {repo.full_name}:{branch}: {e}")
+                except Exception as e:
+                    logger.error(f"AUDIT_ERROR | {repo.full_name}:{branch}: {e}")
 
         if missed:
             logger.warning(f"AUDIT_RESULT | Found {len(missed)} missed commit(s) across org")
         else:
             logger.info("AUDIT_RESULT | No missed commits detected")
 
-        # Return oldest-first
         missed.reverse()
         return missed
 

@@ -97,7 +97,6 @@ to break it down. If no related task exists, use CREATE_NEW.
 summarizing what the changes cover.
 """
 
-MAX_RETRIES = 8
 RETRY_BASE_DELAY = 3  # seconds
 MAX_RETRY_DELAY = 60  # cap backoff at 60s
 
@@ -162,15 +161,24 @@ class GeminiAgent:
     ) -> GeminiResult | None:
         """
         Send a commit batch to Gemini and get a classification result.
-        Returns None if all retries fail.
+        Retries across ALL available (key, model) slots before giving up.
+        Returns None only if every slot has been exhausted.
         """
         user_prompt = self._build_user_prompt(
             commits, created_issues, user_recent_issues, workspace_context,
             primary_author
         )
-        logger.info(f"Classifying batch of {len(commits)} commit(s) with Gemini")
+        total_slots = self._slot_manager.total_slots
+        # Try every slot at least once, plus a few extra retries for transient errors
+        max_attempts = total_slots + 3
+        logger.info(
+            f"CLASSIFY_START | batch={len(commits)} commit(s) | "
+            f"slots={total_slots} | max_attempts={max_attempts}"
+        )
 
-        for attempt in range(MAX_RETRIES):
+        failed_models = set()
+        for attempt in range(max_attempts):
+            key, model = self._slot_manager.get()
             try:
                 result = self._call_gemini(user_prompt)
                 if result:
@@ -179,29 +187,57 @@ class GeminiAgent:
                         logger.warning(f"Gemini result validation errors: {errors}")
                         if result.action not in GeminiResult.VALID_ACTIONS:
                             result.action = "CREATE_NEW"
-                    key, model = self._slot_manager.get()
                     logger.info(
-                        f"Gemini ({model}) classified as {result.action}: {result.title}"
+                        f"CLASSIFY_SUCCESS | model={model} | key=...{key[-4:]} | "
+                        f"action={result.action} | title={result.title} | "
+                        f"attempt={attempt + 1}/{max_attempts}"
                     )
                     return result
-            except requests.exceptions.HTTPError as e:
-                if e.response is not None and e.response.status_code == 429:
-                    self._slot_manager.rotate()
-                    delay = min(RETRY_BASE_DELAY * (2 ** attempt), MAX_RETRY_DELAY)
-                    logger.warning(
-                        f"429 rate limit. Rotating slot, retrying in {delay}s "
-                        f"(attempt {attempt + 1}/{MAX_RETRIES})"
-                    )
-                    time.sleep(delay)
                 else:
-                    logger.error(f"Gemini API error: {e}")
-                    # Try next slot for non-429 errors too (model might not support JSON mode etc.)
+                    # Empty response — model may not support JSON mode
+                    logger.warning(
+                        f"CLASSIFY_EMPTY | model={model} | key=...{key[-4:]} | "
+                        f"attempt={attempt + 1}/{max_attempts} — rotating"
+                    )
+                    failed_models.add(model)
+                    self._slot_manager.rotate()
+
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code if e.response is not None else 0
+                if status == 429:
+                    delay = min(RETRY_BASE_DELAY * (2 ** min(attempt, 5)), MAX_RETRY_DELAY)
+                    logger.warning(
+                        f"CLASSIFY_RATE_LIMITED | model={model} | key=...{key[-4:]} | "
+                        f"HTTP 429 — rotating slot, retry in {delay}s "
+                        f"(attempt {attempt + 1}/{max_attempts})"
+                    )
+                    self._slot_manager.rotate()
+                    time.sleep(delay)
+                elif status in (400, 404):
+                    # Model doesn't exist or doesn't support this request
+                    logger.warning(
+                        f"CLASSIFY_MODEL_ERROR | model={model} | HTTP {status} — "
+                        f"marking as failed, rotating"
+                    )
+                    failed_models.add(model)
+                    self._slot_manager.rotate()
+                else:
+                    logger.error(
+                        f"CLASSIFY_API_ERROR | model={model} | HTTP {status}: {e} — rotating"
+                    )
                     self._slot_manager.rotate()
             except Exception as e:
-                logger.error(f"Gemini call failed: {e}")
+                logger.error(
+                    f"CLASSIFY_FAILED | model={model} | {e} — rotating "
+                    f"(attempt {attempt + 1}/{max_attempts})"
+                )
                 self._slot_manager.rotate()
 
-        logger.error("All Gemini retries exhausted. Skipping batch.")
+        logger.error(
+            f"CLASSIFY_EXHAUSTED | All {max_attempts} attempts failed. "
+            f"Failed models: {sorted(failed_models) if failed_models else 'none'}. "
+            f"Skipping batch."
+        )
         return None
 
     def _call_gemini(self, user_prompt: str) -> GeminiResult | None:
@@ -477,6 +513,12 @@ class GeminiAgent:
                     continue
 
                 text_models.append(short_name)
+                # Log model capabilities
+                logger.info(
+                    f"MODEL_AVAILABLE | {short_name} | "
+                    f"input={input_limit} | output={output_limit} | "
+                    f"methods={','.join(supported)}"
+                )
 
             logger.info(
                 f"MODEL_DISCOVERY | API returned {len(models)} models total — "
@@ -488,6 +530,28 @@ class GeminiAgent:
             if not text_models:
                 logger.warning("MODEL_DISCOVERY | No text-to-text models found from API")
                 return []
+
+            # Verify each model actually works with a quick test call
+            total_candidates = len(text_models)
+            verified_models = []
+            for model_name in text_models:
+                if self._verify_model(key, model_name):
+                    verified_models.append(model_name)
+                else:
+                    logger.warning(f"MODEL_VERIFY_FAILED | {model_name} — excluded from rotation")
+
+            if not verified_models:
+                logger.warning(
+                    "MODEL_DISCOVERY | No models passed verification. "
+                    "Keeping current model list unchanged."
+                )
+                return self._active_models
+
+            text_models = verified_models
+            logger.info(
+                f"MODEL_VERIFY | {len(verified_models)}/{total_candidates} "
+                f"models passed verification"
+            )
 
             # Compare with current list
             current_set = set(self._active_models)
@@ -522,6 +586,50 @@ class GeminiAgent:
         except Exception as e:
             logger.warning(f"MODEL_DISCOVERY | Failed: {e}")
             return []
+
+    def _verify_model(self, api_key: str, model_name: str) -> bool:
+        """
+        Quick verification that a model can produce JSON text output.
+        Sends a tiny prompt and checks for a valid response.
+        Returns True if the model works, False if it fails.
+        """
+        url = f"{config.GEMINI_API_BASE}/{model_name}:generateContent?key={api_key}"
+        payload = {
+            "contents": [
+                {"parts": [{"text": "Reply with exactly: {\"status\":\"ok\"}"}]}
+            ],
+            "generationConfig": {
+                "temperature": 0,
+                "maxOutputTokens": 32,
+            },
+        }
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code == 429:
+                # Rate limited but model exists — assume it works
+                logger.debug(f"MODEL_VERIFY | {model_name}: 429 (rate limited, assuming OK)")
+                return True
+            resp.raise_for_status()
+            data = resp.json()
+            text = (
+                data.get("candidates", [{}])[0]
+                .get("content", {})
+                .get("parts", [{}])[0]
+                .get("text", "")
+            )
+            if text.strip():
+                logger.debug(f"MODEL_VERIFY | {model_name}: OK")
+                return True
+            else:
+                logger.debug(f"MODEL_VERIFY | {model_name}: empty response")
+                return False
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else "?"
+            logger.debug(f"MODEL_VERIFY | {model_name}: HTTP {status}")
+            return False
+        except Exception as e:
+            logger.debug(f"MODEL_VERIFY | {model_name}: {e}")
+            return False
 
     @staticmethod
     def _build_cache_cleanup_prompt(entries: list[dict]) -> str:

@@ -123,6 +123,7 @@ def main():
             # --- Step C: Process ready batches ---
             while buffer.is_ready() and not _shutdown:
                 batch = None
+                batch_succeeded = False
                 try:
                     batch = buffer.get_batch()
                     all_created_issues = state.get_created_issues()
@@ -144,26 +145,36 @@ def main():
                         workspace_context, primary_author
                     )
 
-                    if result:
-                        source_shas = [c.sha for c in batch]
-
-                        # Guard check — block spam/duplicates before Linear execution
-                        # Guard uses ALL issues (SHA dedup must check across all users)
-                        verdict = guard.evaluate(
-                            result, source_shas, all_created_issues,
-                            user_recent_issues, primary_author
+                    if result is None:
+                        # Gemini exhausted all retries — keep batch in buffer for next cycle
+                        logger.warning(
+                            f"BATCH_RETAINED | Gemini classification failed. "
+                            f"Keeping {len(batch)} commit(s) in buffer for retry next cycle."
                         )
-                        if not verdict:
-                            logger.info(
-                                f"GUARD_BLOCKED | action={result.action} | "
-                                f"check={verdict.check_name} | reason={verdict.reason}"
-                            )
-                            continue
+                        break  # Exit batch loop, will retry next poll cycle
 
-                        try:
-                            linear.execute(result, source_shas, primary_author)
-                        except Exception as e:
-                            logger.error(f"LINEAR_EXECUTE_ERROR | {result.action} | {result.title} | {e}", exc_info=True)
+                    source_shas = [c.sha for c in batch]
+
+                    # Guard check — block spam/duplicates before Linear execution
+                    # Guard uses ALL issues (SHA dedup must check across all users)
+                    verdict = guard.evaluate(
+                        result, source_shas, all_created_issues,
+                        user_recent_issues, primary_author
+                    )
+                    if not verdict:
+                        logger.info(
+                            f"GUARD_BLOCKED | action={result.action} | "
+                            f"check={verdict.check_name} | reason={verdict.reason}"
+                        )
+                        batch_succeeded = True  # Guard blocked intentionally — don't retry
+                    else:
+                        # Execute Linear action
+                        linear.execute(result, source_shas, primary_author)
+                        batch_succeeded = True
+                        logger.info(
+                            f"BATCH_COMPLETE | action={result.action} | "
+                            f"title={result.title} | commits={len(batch)}"
+                        )
 
                         # Track classification for self-improvement
                         try:
@@ -183,9 +194,16 @@ def main():
 
                 except Exception as e:
                     logger.error(f"BATCH_PROCESS_ERROR | {e}", exc_info=True)
+                    # On unexpected error, retain batch for retry
+                    if batch and not batch_succeeded:
+                        logger.warning(
+                            f"BATCH_RETAINED | Error during processing. "
+                            f"Keeping {len(batch)} commit(s) in buffer."
+                        )
+                        break  # Exit batch loop, will retry next poll cycle
                 finally:
-                    # Always clear the batch to prevent infinite retry loops
-                    if batch:
+                    # Only clear batch if task creation succeeded or was intentionally blocked
+                    if batch and batch_succeeded:
                         try:
                             buffer.clear_batch(batch)
                         except Exception as e:
