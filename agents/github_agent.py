@@ -367,6 +367,11 @@ class GitHubAgent:
         elif commit.commit.author:
             author_name = commit.commit.author.name
 
+        # Sanitize: reject garbage author names (single chars, symbols, empty)
+        if not author_name or len(author_name.strip()) < 2 or not any(c.isalnum() for c in author_name):
+            logger.debug(f"Invalid author name '{author_name}' for {commit.sha[:8]}, using 'unknown'")
+            author_name = "unknown"
+
         # Fetch file/line stats (triggers one extra API call per commit)
         files_changed = 0
         lines_changed = 0
@@ -407,6 +412,10 @@ class GitHubAgent:
             author = commit.author.login.lower()
         elif commit.commit.author:
             author = commit.commit.author.name.lower()
+
+        # Skip garbage/invalid author names (single chars, symbols)
+        if not author or len(author) < 2 or not any(c.isalnum() for c in author):
+            return f"invalid_author:{author or 'empty'}"
 
         if author.endswith(BOT_SUFFIX):
             return f"bot_author:{author}"
