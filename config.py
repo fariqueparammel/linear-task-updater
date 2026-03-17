@@ -47,6 +47,16 @@ MODEL_REFRESH_SECONDS = int(os.getenv("MODEL_REFRESH_SECONDS", "3600"))  # 1 hou
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 VERBOSE_REPO_SCAN = os.getenv("VERBOSE_REPO_SCAN", "false").lower() == "true"  # Log each repo's SHA check
 
+# --- Per-user exclusion ---
+# Comma-separated GitHub usernames whose commits should NOT create Linear tasks.
+# Their commits are still tracked (SHA advances) but skipped during batch processing.
+# Example: EXCLUDED_GITHUB_USERS=bot-user,intern-account
+EXCLUDED_GITHUB_USERS = {
+    u.strip().lower()
+    for u in os.getenv("EXCLUDED_GITHUB_USERS", "").split(",")
+    if u.strip()
+}
+
 # --- Paths ---
 STATE_DIR = os.path.join(os.path.dirname(__file__), "state")
 LOGS_DIR = os.path.join(os.path.dirname(__file__), "logs")

@@ -348,19 +348,28 @@ class LinearAgent:
 
         # Direct match
         if name_lower in self._user_cache:
+            logger.debug(f"ASSIGNEE_RESOLVE | '{assignee_name}' → direct match in user cache")
             return self._user_cache[name_lower]
 
         # Substring / fuzzy match
         for cached_name, uid in self._user_cache.items():
             if name_lower in cached_name or cached_name in name_lower:
+                logger.debug(
+                    f"ASSIGNEE_RESOLVE | '{assignee_name}' → substring match "
+                    f"(cached key: '{cached_name}')"
+                )
                 return uid
 
         # Check against full member details (displayName exact match, case-insensitive)
         for m in self._members_detail:
             if m["displayName"].strip().lower() == name_lower:
+                logger.debug(f"ASSIGNEE_RESOLVE | '{assignee_name}' → member detail match")
                 return m["id"]
 
-        logger.warning(f"Could not resolve assignee '{assignee_name}' to a Linear user")
+        logger.warning(
+            f"ASSIGNEE_RESOLVE_FAILED | Could not resolve '{assignee_name}' to a Linear user. "
+            f"Known keys: {list(self._user_cache.keys())}"
+        )
         return None
 
     def resolve_state_id(self, state_name: str | None) -> str | None:
@@ -394,7 +403,8 @@ class LinearAgent:
         Map a GitHub username to a Linear user ID.
         1. Direct name/email match
         2. Substring match
-        3. MappingAgent AI-powered resolution (project context + elimination)
+        3. Process of elimination — if all other members are mapped, the remaining one is this user
+        4. MappingAgent AI-powered resolution (project context + elimination)
         """
         username_lower = github_username.strip().lower()
         # Direct match on display name or email prefix
@@ -405,6 +415,39 @@ class LinearAgent:
             if username_lower in name or name in username_lower:
                 return uid
 
+        # Process of elimination: gather already-mapped Linear user IDs, find unmapped members
+        known_mappings = {}
+        if self._mapping_agent:
+            known_mappings = self._mapping_agent.get_known_mappings()
+        mapped_user_ids = set()
+        for _gh_user, linear_name in known_mappings.items():
+            for m in self._members_detail:
+                if m["displayName"].lower() == linear_name.lower():
+                    mapped_user_ids.add(m["id"])
+                    break
+        unmapped_members = [
+            m for m in self._members_detail if m["id"] not in mapped_user_ids
+        ]
+        if len(unmapped_members) == 1:
+            match = unmapped_members[0]
+            uid = match["id"]
+            display_name = match["displayName"]
+            logger.info(
+                f"ASSIGNEE_ELIMINATION | '{github_username}' → '{display_name}' "
+                f"(only unmapped member remaining out of {len(self._members_detail)})"
+            )
+            # Cache for future fast lookups
+            self._user_cache[username_lower] = uid
+            self._user_cache[display_name.lower()] = uid
+            self._cache.set("team_members", self._user_cache)
+            return uid
+        elif unmapped_members:
+            logger.info(
+                f"ASSIGNEE_ELIMINATION | '{github_username}' has {len(unmapped_members)} "
+                f"unmapped candidates: {[m['displayName'] for m in unmapped_members]}. "
+                f"Cannot determine by elimination alone."
+            )
+
         # Fallback: use MappingAgent with project context
         if self._mapping_agent and self._members_detail:
             logger.info(
@@ -412,7 +455,6 @@ class LinearAgent:
                 f"Invoking MappingAgent for AI-powered resolution..."
             )
             project_context = self.fetch_project_assignees()
-            known_mappings = self._mapping_agent.get_known_mappings()
 
             result = self._mapping_agent.resolve(
                 github_username=github_username,
@@ -435,6 +477,10 @@ class LinearAgent:
                 )
                 return uid
 
+        logger.warning(
+            f"ASSIGNEE_UNRESOLVED | '{github_username}' could not be mapped to any "
+            f"Linear member. Issue will be created without assignee."
+        )
         return None
 
     def fetch_user_recent_issues(self, github_username: str) -> list[dict]:
@@ -833,6 +879,17 @@ class LinearAgent:
         """Create a new Linear issue with auto-sync label."""
         label_ids = self._resolve_label_ids(result.label)
         assignee_id = self.resolve_assignee_id(result.assignee)
+
+        # Fallback: if Gemini couldn't match the assignee, resolve from GitHub username
+        if not assignee_id and primary_author:
+            logger.info(
+                f"ASSIGNEE_FALLBACK | Gemini assignee '{result.assignee}' not resolved. "
+                f"Trying GitHub username '{primary_author}' → Linear user mapping..."
+            )
+            assignee_id = self._resolve_github_to_linear_user(primary_author)
+            if assignee_id:
+                logger.info(f"ASSIGNEE_FALLBACK_OK | '{primary_author}' resolved via GitHub→Linear mapping")
+
         state_id = self.resolve_state_id(result.state)
         project_id = self.resolve_project_id(result.project)
 
@@ -915,6 +972,17 @@ class LinearAgent:
 
         label_ids = self._resolve_label_ids(result.label)
         assignee_id = self.resolve_assignee_id(result.assignee)
+
+        # Fallback: if Gemini couldn't match the assignee, resolve from GitHub username
+        if not assignee_id and primary_author:
+            logger.info(
+                f"ASSIGNEE_FALLBACK | Gemini assignee '{result.assignee}' not resolved. "
+                f"Trying GitHub username '{primary_author}' → Linear user mapping..."
+            )
+            assignee_id = self._resolve_github_to_linear_user(primary_author)
+            if assignee_id:
+                logger.info(f"ASSIGNEE_FALLBACK_OK | '{primary_author}' resolved via GitHub→Linear mapping")
+
         state_id = self.resolve_state_id(result.state)
         project_id = self.resolve_project_id(result.project)
 

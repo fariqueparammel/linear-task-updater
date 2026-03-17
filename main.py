@@ -46,6 +46,7 @@ def main():
     logger.info(f"  Batch timeout: {config.BATCH_TIMEOUT_SECONDS}s")
     logger.info(f"  Dry run:       {config.DRY_RUN}")
     logger.info(f"  Verbose scan:  {config.VERBOSE_REPO_SCAN}")
+    logger.info(f"  Excluded users:{sorted(config.EXCLUDED_GITHUB_USERS) if config.EXCLUDED_GITHUB_USERS else 'none'}")
     logger.info(f"  Gemini keys:   {len(config.GEMINI_KEYS)}")
     logger.info("=" * 60)
 
@@ -130,6 +131,16 @@ def main():
 
                     # Per-user correlation
                     primary_author = batch[0].author if batch else None
+
+                    # Per-user exclusion: skip task creation for excluded users
+                    if primary_author and primary_author.lower() in config.EXCLUDED_GITHUB_USERS:
+                        logger.info(
+                            f"USER_EXCLUDED | author={primary_author} | "
+                            f"Skipping {len(batch)} commit(s) — user is in EXCLUDED_GITHUB_USERS"
+                        )
+                        batch_succeeded = True  # Intentional skip — clear batch
+                        continue
+
                     user_recent_issues = None
                     if primary_author:
                         try:

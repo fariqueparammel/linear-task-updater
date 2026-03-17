@@ -323,6 +323,9 @@ class GeminiAgent:
                 lines.append(
                     f"\nThe commit author's GitHub username is \"{author}\". "
                     f"Match this to one of the team members above. "
+                    f"GitHub usernames often combine first+last name (e.g. 'johndoe' = 'John Doe', "
+                    f"'fariqueparammel' = 'farique'). Check if the username contains or starts with "
+                    f"a team member's displayName or email prefix. "
                     f"Use name similarity, email prefix, or elimination to determine "
                     f"the correct assignee. The assignee MUST be an exact displayName from above."
                 )
